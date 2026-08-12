@@ -1,9 +1,8 @@
 """
-FileSend Relay Server v2.0
---------------------------
-Servidor relay otimizado para plataformas de nuvem com suspensão automática (Render, Koyeb).
-Utiliza FileResponse para entregas HTTP com Content-Length garantido, suporte a CORS,
-e limpeza automática de arquivos de uso único.
+FileSend Relay Server v3.0 — Chat & Transferência Direta
+--------------------------------------------------------
+Servidor relay para transferência de arquivos e mensagens diretas em tempo real
+via WebSockets e HTTP.
 """
 
 import os
@@ -16,7 +15,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
@@ -34,7 +33,7 @@ CODE_ALPHABET = "".join(c for c in (string.ascii_uppercase + string.digits) if c
 
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="FileSend Relay", version="2.0.0")
+app = FastAPI(title="FileSend Relay", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,7 +44,39 @@ app.add_middleware(
 
 _lock = threading.Lock()
 
+# ----------------------------------------------------------------------------
+# Gerenciador de WebSockets (Chat 1 a 1 / Canais Diretos)
+# ----------------------------------------------------------------------------
+class ConnectionManager:
+    def __init__(self):
+        # Dicionário de canais privados: {channel_id: [websocket_1, websocket_2]}
+        self.active_connections: dict[str, list[WebSocket]] = {}
 
+    async def connect(self, websocket: WebSocket, channel_id: str):
+        await websocket.accept()
+        if channel_id not in self.active_connections:
+            self.active_connections[channel_id] = []
+        self.active_connections[channel_id].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, channel_id: str):
+        if channel_id in self.active_connections:
+            if websocket in self.active_connections[channel_id]:
+                self.active_connections[channel_id].remove(websocket)
+            if not self.active_connections[channel_id]:
+                del self.active_connections[channel_id]
+
+    async def broadcast_to_channel(self, message: str, channel_id: str, sender_ws: WebSocket):
+        if channel_id in self.active_connections:
+            for connection in self.active_connections[channel_id]:
+                if connection != sender_ws:
+                    await connection.send_text(message)
+
+manager = ConnectionManager()
+
+
+# ----------------------------------------------------------------------------
+# Auxiliares de Metadados
+# ----------------------------------------------------------------------------
 def _load_metadata() -> dict:
     if METADATA_FILE.exists():
         try:
@@ -100,6 +131,9 @@ def _delete_file(code: str, metadata: dict, save: bool = True) -> None:
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
+# ----------------------------------------------------------------------------
+# Modelos
+# ----------------------------------------------------------------------------
 class UploadResponse(BaseModel):
     code: str
     filename: str
@@ -114,9 +148,28 @@ class FileInfoResponse(BaseModel):
     expires_at: str
 
 
+# ----------------------------------------------------------------------------
+# Endpoints HTTP & WebSocket
+# ----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+
+@app.websocket("/ws/{channel_id}")
+async def websocket_endpoint(websocket: WebSocket, channel_id: str):
+    """
+    Endpoint de WebSocket para troca de mensagens cifradas em tempo real
+    no canal direto entre dois usuários.
+    """
+    await manager.connect(websocket, channel_id)
+    try:
+        while True:
+            # Recebe o pacote cifrado e retransmite para o outro participante do canal
+            data = await websocket.receive_text()
+            await manager.broadcast_to_channel(data, channel_id, sender_ws=websocket)
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, channel_id)
 
 
 @app.post("/upload", response_model=UploadResponse)
