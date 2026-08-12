@@ -32,6 +32,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
+from fastapi.responses import FileResponse
+
 # ----------------------------------------------------------------------------
 # Configuração
 # ----------------------------------------------------------------------------
@@ -218,29 +220,20 @@ def download_file(code: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Arquivo não encontrado no servidor")
 
-    def iterfile():
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                yield chunk
-
     def cleanup_after_download():
-        # Executa depois que a resposta termina de ser enviada ao cliente.
-        # Torna o código de uso único: uma vez baixado, o arquivo some do servidor.
         with _lock:
             current_metadata = _load_metadata()
             if code in current_metadata:
                 _delete_file(code, current_metadata)
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="{info["filename"]}"',
-        "Content-Length": str(info["size"]),
-    }
     background = BackgroundTask(cleanup_after_download) if DELETE_AFTER_DOWNLOAD else None
-    return StreamingResponse(
-        iterfile(), media_type="application/octet-stream", headers=headers, background=background
+
+    # FileResponse gerencia o buffer e o cabeçalho Content-Length de forma nativa e segura
+    return FileResponse(
+        path=file_path,
+        filename=info["filename"],
+        media_type="application/octet-stream",
+        background=background
     )
 
 
