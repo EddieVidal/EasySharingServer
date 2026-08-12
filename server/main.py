@@ -1,19 +1,9 @@
 """
-FileSend Relay Server
-----------------------
-Servidor relay simples para compartilhamento de arquivos entre computadores
-em redes/internets diferentes. Feito para rodar na Koyeb (ou qualquer host
-que suporte containers Docker).
-
-Fluxo:
-  1. Cliente A faz POST /upload -> recebe um código de 6 caracteres.
-  2. Cliente A compartilha o código com o Cliente B por qualquer meio (chat, etc).
-  3. Cliente B faz GET /files/{code} para ver metadados (nome, tamanho).
-  4. Cliente B faz GET /download/{code} para baixar o arquivo.
-  5. Assim que o download termina de ser entregue, o arquivo é apagado
-     automaticamente do servidor (código de uso único). Isso pode ser
-     desligado com a variável de ambiente DELETE_AFTER_DOWNLOAD=false.
-  6. Arquivos nunca baixados expiram sozinhos após EXPIRATION_HOURS (padrão 6h).
+FileSend Relay Server v2.0
+--------------------------
+Servidor relay otimizado para plataformas de nuvem com suspensão automática (Render, Koyeb).
+Utiliza FileResponse para entregas HTTP com Content-Length garantido, suporte a CORS,
+e limpeza automática de arquivos de uso único.
 """
 
 import os
@@ -27,29 +17,24 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-# ----------------------------------------------------------------------------
-# Configuração
-# ----------------------------------------------------------------------------
 STORAGE_DIR = Path(os.environ.get("STORAGE_DIR", "./storage"))
 METADATA_FILE = STORAGE_DIR / "_metadata.json"
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "200"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 EXPIRATION_HOURS = float(os.environ.get("EXPIRATION_HOURS", "6"))
 DELETE_AFTER_DOWNLOAD = os.environ.get("DELETE_AFTER_DOWNLOAD", "true").lower() == "true"
-CHUNK_SIZE = 1024 * 1024  # 1MB por chunk (upload/download em stream)
+CHUNK_SIZE = 1024 * 1024
 CODE_LENGTH = 6
-CODE_ALPHABET = "".join(
-    c for c in (string.ascii_uppercase + string.digits) if c not in "0O1IL"
-)  # remove caracteres ambíguos
+CODE_ALPHABET = "".join(c for c in (string.ascii_uppercase + string.digits) if c not in "0O1IL")
 
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="FileSend Relay", version="1.0.0")
+app = FastAPI(title="FileSend Relay", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,9 +46,6 @@ app.add_middleware(
 _lock = threading.Lock()
 
 
-# ----------------------------------------------------------------------------
-# Metadados (persistidos em JSON para sobreviver a restarts)
-# ----------------------------------------------------------------------------
 def _load_metadata() -> dict:
     if METADATA_FILE.exists():
         try:
@@ -84,9 +66,6 @@ def _generate_code(existing: dict) -> str:
             return code
 
 
-# ----------------------------------------------------------------------------
-# Limpeza automática de arquivos expirados
-# ----------------------------------------------------------------------------
 def _cleanup_loop():
     while True:
         try:
@@ -104,9 +83,9 @@ def _cleanup_loop():
                     _delete_file(code, metadata, save=False)
                 if expired_codes:
                     _save_metadata(metadata)
-        except Exception as exc:  # nunca deixar a thread morrer
+        except Exception as exc:
             print(f"[cleanup] erro: {exc}")
-        time.sleep(300)  # verifica a cada 5 minutos
+        time.sleep(300)
 
 
 def _delete_file(code: str, metadata: dict, save: bool = True) -> None:
@@ -121,9 +100,6 @@ def _delete_file(code: str, metadata: dict, save: bool = True) -> None:
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
-# ----------------------------------------------------------------------------
-# Modelos de resposta
-# ----------------------------------------------------------------------------
 class UploadResponse(BaseModel):
     code: str
     filename: str
@@ -138,9 +114,6 @@ class FileInfoResponse(BaseModel):
     expires_at: str
 
 
-# ----------------------------------------------------------------------------
-# Endpoints
-# ----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
@@ -218,29 +191,19 @@ def download_file(code: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Arquivo não encontrado no servidor")
 
-    def iterfile():
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                yield chunk
-
     def cleanup_after_download():
-        # Executa depois que a resposta termina de ser enviada ao cliente.
-        # Torna o código de uso único: uma vez baixado, o arquivo some do servidor.
         with _lock:
             current_metadata = _load_metadata()
             if code in current_metadata:
                 _delete_file(code, current_metadata)
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="{info["filename"]}"',
-        "Content-Length": str(info["size"]),
-    }
     background = BackgroundTask(cleanup_after_download) if DELETE_AFTER_DOWNLOAD else None
-    return StreamingResponse(
-        iterfile(), media_type="application/octet-stream", headers=headers, background=background
+
+    return FileResponse(
+        path=file_path,
+        filename=info["filename"],
+        media_type="application/octet-stream",
+        background=background
     )
 
 
@@ -257,6 +220,5 @@ def delete_file(code: str):
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
