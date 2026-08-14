@@ -1,8 +1,9 @@
 """
-FileSend Relay Server v3.0 — Chat & Transferência Direta
---------------------------------------------------------
-Servidor relay para transferência de arquivos e mensagens diretas em tempo real
-via WebSockets e HTTP.
+FileSend Relay Server v2.0
+--------------------------
+Servidor relay otimizado para plataformas de nuvem com suspensão automática (Render, Koyeb).
+Utiliza FileResponse para entregas HTTP com Content-Length garantido, suporte a CORS,
+e limpeza automática de arquivos de uso único.
 """
 
 import os
@@ -11,6 +12,7 @@ import time
 import shutil
 import string
 import secrets
+import asyncio
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -31,9 +33,13 @@ CHUNK_SIZE = 1024 * 1024
 CODE_LENGTH = 6
 CODE_ALPHABET = "".join(c for c in (string.ascii_uppercase + string.digits) if c not in "0O1IL")
 
+# Fila de mensagens de chat não entregues (destinatário offline no momento do envio)
+MESSAGE_QUEUE_HOURS = float(os.environ.get("MESSAGE_QUEUE_HOURS", "48"))
+MESSAGE_QUEUE_MAX_PER_CHANNEL = int(os.environ.get("MESSAGE_QUEUE_MAX_PER_CHANNEL", "50"))
+
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="FileSend Relay", version="3.0.0")
+app = FastAPI(title="FileSend Relay", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,39 +50,7 @@ app.add_middleware(
 
 _lock = threading.Lock()
 
-# ----------------------------------------------------------------------------
-# Gerenciador de WebSockets (Chat 1 a 1 / Canais Diretos)
-# ----------------------------------------------------------------------------
-class ConnectionManager:
-    def __init__(self):
-        # Dicionário de canais privados: {channel_id: [websocket_1, websocket_2]}
-        self.active_connections: dict[str, list[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket, channel_id: str):
-        await websocket.accept()
-        if channel_id not in self.active_connections:
-            self.active_connections[channel_id] = []
-        self.active_connections[channel_id].append(websocket)
-
-    def disconnect(self, websocket: WebSocket, channel_id: str):
-        if channel_id in self.active_connections:
-            if websocket in self.active_connections[channel_id]:
-                self.active_connections[channel_id].remove(websocket)
-            if not self.active_connections[channel_id]:
-                del self.active_connections[channel_id]
-
-    async def broadcast_to_channel(self, message: str, channel_id: str, sender_ws: WebSocket):
-        if channel_id in self.active_connections:
-            for connection in self.active_connections[channel_id]:
-                if connection != sender_ws:
-                    await connection.send_text(message)
-
-manager = ConnectionManager()
-
-
-# ----------------------------------------------------------------------------
-# Auxiliares de Metadados
-# ----------------------------------------------------------------------------
 def _load_metadata() -> dict:
     if METADATA_FILE.exists():
         try:
@@ -131,9 +105,152 @@ def _delete_file(code: str, metadata: dict, save: bool = True) -> None:
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
-# ----------------------------------------------------------------------------
-# Modelos
-# ----------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Relay de Chat em Tempo Real (WebSocket) com fila de entrega pendente
+# ------------------------------------------------------------------
+class ChatConnectionManager:
+    """
+    Mantém as conexões WebSocket agrupadas por canal (channel_id).
+    Cada canal representa uma conversa 1-a-1 entre dois usuários
+    (o channel_id é derivado no cliente a partir dos dois IDs).
+
+    Se o destinatário não estiver conectado no momento do envio, a
+    mensagem (já cifrada ponta-a-ponta pelo cliente — o servidor nunca
+    vê o conteúdo em claro) fica guardada em memória e é entregue assim
+    que ele conectar. Para saber "quem é quem" dentro do canal, cada
+    cliente se identifica com uma mensagem {"type": "hello", "user_id": ...}
+    logo após abrir a conexão.
+    """
+
+    def __init__(self):
+        self.channels: dict[str, list[WebSocket]] = {}
+        self.connection_user: dict[WebSocket, str] = {}
+        self.pending: dict[str, list[dict]] = {}
+        self._ws_lock = asyncio.Lock()
+
+    async def connect(self, channel_id: str, websocket: WebSocket) -> None:
+        await websocket.accept()
+        async with self._ws_lock:
+            self.channels.setdefault(channel_id, []).append(websocket)
+
+    async def disconnect(self, channel_id: str, websocket: WebSocket) -> None:
+        async with self._ws_lock:
+            conns = self.channels.get(channel_id)
+            if conns and websocket in conns:
+                conns.remove(websocket)
+            if conns is not None and not conns:
+                self.channels.pop(channel_id, None)
+            self.connection_user.pop(websocket, None)
+
+    async def register_user(self, channel_id: str, websocket: WebSocket, user_id: str) -> None:
+        """Associa a conexão a um user_id e entrega qualquer mensagem que
+        estava esperando por ele (tudo que não foi originalmente enviado
+        por ele mesmo)."""
+        async with self._ws_lock:
+            self.connection_user[websocket] = user_id
+            queued = self.pending.get(channel_id, [])
+            to_deliver = [m for m in queued if m["sender_id"] != user_id]
+            still_pending = [m for m in queued if m["sender_id"] == user_id]
+            if still_pending:
+                self.pending[channel_id] = still_pending
+            else:
+                self.pending.pop(channel_id, None)
+
+        for msg in to_deliver:
+            try:
+                await websocket.send_text(msg["payload"])
+            except Exception:
+                pass
+
+    async def broadcast_or_queue(self, channel_id: str, message: str, sender: WebSocket) -> None:
+        """Entrega a mensagem a quem estiver conectado no canal (exceto o
+        remetente). Se ninguém mais estiver conectado, guarda na fila para
+        entrega quando o destinatário conectar."""
+        async with self._ws_lock:
+            conns = list(self.channels.get(channel_id, []))
+            sender_id = self.connection_user.get(sender, "desconhecido")
+            others = [c for c in conns if c is not sender]
+
+        delivered = False
+        for conn in others:
+            try:
+                await conn.send_text(message)
+                delivered = True
+            except Exception:
+                pass
+
+        if delivered:
+            return
+
+        async with self._ws_lock:
+            queue = self.pending.setdefault(channel_id, [])
+            queue.append({
+                "sender_id": sender_id,
+                "payload": message,
+                "queued_at": datetime.now(timezone.utc).isoformat(),
+            })
+            if len(queue) > MESSAGE_QUEUE_MAX_PER_CHANNEL:
+                del queue[: len(queue) - MESSAGE_QUEUE_MAX_PER_CHANNEL]
+
+    async def purge_expired(self) -> None:
+        """Remove mensagens pendentes mais antigas que MESSAGE_QUEUE_HOURS."""
+        now = datetime.now(timezone.utc)
+        async with self._ws_lock:
+            for channel_id in list(self.pending.keys()):
+                fresh = []
+                for msg in self.pending[channel_id]:
+                    queued_at = datetime.fromisoformat(msg["queued_at"])
+                    if now - queued_at < timedelta(hours=MESSAGE_QUEUE_HOURS):
+                        fresh.append(msg)
+                if fresh:
+                    self.pending[channel_id] = fresh
+                else:
+                    self.pending.pop(channel_id, None)
+
+
+chat_manager = ChatConnectionManager()
+
+
+@app.on_event("startup")
+async def _start_chat_queue_cleanup():
+    async def loop():
+        while True:
+            await asyncio.sleep(300)
+            try:
+                await chat_manager.purge_expired()
+            except Exception as exc:
+                print(f"[chat cleanup] erro: {exc}")
+
+    asyncio.create_task(loop())
+
+
+@app.websocket("/ws/{channel_id}")
+async def chat_websocket(websocket: WebSocket, channel_id: str):
+    await chat_manager.connect(channel_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+
+            try:
+                parsed = json.loads(data)
+            except json.JSONDecodeError:
+                parsed = None
+
+            if isinstance(parsed, dict) and parsed.get("type") == "hello":
+                user_id = str(parsed.get("user_id", "")).strip().upper()
+                if user_id:
+                    await chat_manager.register_user(channel_id, websocket, user_id)
+                continue
+
+            await chat_manager.broadcast_or_queue(channel_id, data, sender=websocket)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[ws:{channel_id}] erro: {exc}")
+    finally:
+        await chat_manager.disconnect(channel_id, websocket)
+
+
 class UploadResponse(BaseModel):
     code: str
     filename: str
@@ -148,28 +265,9 @@ class FileInfoResponse(BaseModel):
     expires_at: str
 
 
-# ----------------------------------------------------------------------------
-# Endpoints HTTP & WebSocket
-# ----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
-
-
-@app.websocket("/ws/{channel_id}")
-async def websocket_endpoint(websocket: WebSocket, channel_id: str):
-    """
-    Endpoint de WebSocket para troca de mensagens cifradas em tempo real
-    no canal direto entre dois usuários.
-    """
-    await manager.connect(websocket, channel_id)
-    try:
-        while True:
-            # Recebe o pacote cifrado e retransmite para o outro participante do canal
-            data = await websocket.receive_text()
-            await manager.broadcast_to_channel(data, channel_id, sender_ws=websocket)
-    except WebSocketDisconnect:
-        manager.disconnect(websocket, channel_id)
 
 
 @app.post("/upload", response_model=UploadResponse)
