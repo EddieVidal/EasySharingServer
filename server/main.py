@@ -9,6 +9,7 @@ e limpeza automática de arquivos de uso único.
 import os
 import json
 import time
+import base64
 import shutil
 import string
 import secrets
@@ -62,7 +63,67 @@ def _load_metadata() -> dict:
 
 def _save_metadata(data: dict) -> None:
     METADATA_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+# ==================================================================
+# GERENCIAMENTO DE GRUPOS (INSERIR AQUI)
+# ==================================================================
+GROUPS_FILE = STORAGE_DIR / "_groups.json"
 
+def _load_groups() -> dict:
+    if GROUPS_FILE.exists():
+        try:
+            return json.loads(GROUPS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+def _save_groups(data: dict) -> None:
+    GROUPS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+# Schema para criação de grupo
+class CreateGroupRequest(BaseModel):
+    group_name: str
+    members: list[str]  # Ex: ["USER-AAAA", "USER-BBBB"]
+
+# Endpoints HTTP para Grupos
+@app.post("/groups")
+def create_group(req: CreateGroupRequest):
+    if not req.group_name.strip() or len(req.members) < 2:
+        raise HTTPException(status_code=400, detail="Nome do grupo inválido ou menos de 2 membros.")
+    
+    with _lock:
+        groups = _load_groups()
+        group_id = "GROUP-" + secrets.token_hex(6).upper()
+        # Gera uma chave simétrica aleatória de 32 bytes para o grupo (em Base64)
+        group_key = base64.b64encode(os.urandom(32)).decode("ascii")
+        
+        normalized_members = list(set([m.strip().upper() for m in req.members]))
+        
+        groups[group_id] = {
+            "group_id": group_id,
+            "name": req.group_name.strip(),
+            "key": group_key,
+            "members": normalized_members,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        _save_groups(groups)
+    return groups[group_id]
+
+@app.get("/groups/{user_id}")
+def get_user_groups(user_id: str):
+    user_id = user_id.strip().upper()
+    groups = _load_groups()
+    user_groups = [
+        {
+            "group_id": g_id, 
+            "name": g_info["name"], 
+            "key": g_info["key"], 
+            "members": g_info["members"]
+        }
+        for g_id, g_info in groups.items()
+        if user_id in g_info["members"]
+    ]
+    return user_groups
+# ==================================================================
 
 def _generate_code(existing: dict) -> str:
     while True:
