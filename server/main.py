@@ -37,6 +37,28 @@ CODE_ALPHABET = "".join(c for c in (string.ascii_uppercase + string.digits) if c
 # Fila de mensagens de chat não entregues (destinatário offline no momento do envio)
 MESSAGE_QUEUE_HOURS = float(os.environ.get("MESSAGE_QUEUE_HOURS", "48"))
 MESSAGE_QUEUE_MAX_PER_CHANNEL = int(os.environ.get("MESSAGE_QUEUE_MAX_PER_CHANNEL", "50"))
+CHAT_QUEUE_FILE = STORAGE_DIR / "_chat_queue.json"
+_chat_queue_file_lock = threading.Lock()
+
+
+def _load_chat_queue() -> dict:
+    """Carrega do disco a fila de mensagens pendentes, para sobreviver a reinícios do servidor
+    (importante em plataformas com suspensão automática como Render/Koyeb)."""
+    if CHAT_QUEUE_FILE.exists():
+        try:
+            return json.loads(CHAT_QUEUE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_chat_queue(data: dict) -> None:
+    with _chat_queue_file_lock:
+        try:
+            CHAT_QUEUE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError as exc:
+            print(f"[chat queue] erro ao salvar fila em disco: {exc}")
+
 
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -172,22 +194,35 @@ threading.Thread(target=_cleanup_loop, daemon=True).start()
 class ChatConnectionManager:
     """
     Mantém as conexões WebSocket agrupadas por canal (channel_id).
-    Cada canal representa uma conversa 1-a-1 entre dois usuários
-    (o channel_id é derivado no cliente a partir dos dois IDs).
+    Cada canal representa uma conversa 1-a-1 ou um grupo (o channel_id é
+    derivado no cliente a partir dos IDs envolvidos, ou é o próprio GROUP-ID).
 
-    Se o destinatário não estiver conectado no momento do envio, a
+    Se um destinatário não estiver conectado no momento do envio, a
     mensagem (já cifrada ponta-a-ponta pelo cliente — o servidor nunca
-    vê o conteúdo em claro) fica guardada em memória e é entregue assim
-    que ele conectar. Para saber "quem é quem" dentro do canal, cada
+    vê o conteúdo em claro) fica guardada até que ele conecte. Cada
     cliente se identifica com uma mensagem {"type": "hello", "user_id": ...}
     logo após abrir a conexão.
+
+    Cada mensagem pendente guarda "delivered_to": a lista de user_ids que já
+    a receberam. Isso garante que, em grupos com 3+ membros, a mensagem só é
+    removida da fila por expiração (MESSAGE_QUEUE_HOURS) ou limite de
+    tamanho — nunca porque só um dos membros offline já reconectou — assim
+    todo mundo que estava offline recebe a mensagem quando voltar.
+
+    A fila também é persistida em disco (_chat_queue.json), para sobreviver
+    a reinícios do servidor em plataformas com suspensão automática
+    (Render, Koyeb).
     """
 
     def __init__(self):
         self.channels: dict[str, list[WebSocket]] = {}
         self.connection_user: dict[WebSocket, str] = {}
-        self.pending: dict[str, list[dict]] = {}
+        self.pending: dict[str, list[dict]] = _load_chat_queue()
         self._ws_lock = asyncio.Lock()
+
+    def _persist(self) -> None:
+        # Sempre chamado a partir de um trecho já protegido por _ws_lock.
+        _save_chat_queue(self.pending)
 
     async def connect(self, channel_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -204,18 +239,24 @@ class ChatConnectionManager:
             self.connection_user.pop(websocket, None)
 
     async def register_user(self, channel_id: str, websocket: WebSocket, user_id: str) -> None:
-        """Associa a conexão a um user_id e entrega qualquer mensagem que
-        estava esperando por ele (tudo que não foi originalmente enviado
-        por ele mesmo)."""
+        """Associa a conexão a um user_id e entrega as mensagens pendentes
+        que ainda não foram enviadas a esse usuário especificamente
+        (nunca reenvia a própria mensagem de volta ao remetente, e nunca
+        reenvia duas vezes para quem já recebeu — importante em grupos)."""
         async with self._ws_lock:
             self.connection_user[websocket] = user_id
             queued = self.pending.get(channel_id, [])
-            to_deliver = [m for m in queued if m["sender_id"] != user_id]
-            still_pending = [m for m in queued if m["sender_id"] == user_id]
-            if still_pending:
-                self.pending[channel_id] = still_pending
-            else:
-                self.pending.pop(channel_id, None)
+            to_deliver = []
+            for msg in queued:
+                if msg.get("sender_id") == user_id:
+                    continue
+                delivered_to = msg.setdefault("delivered_to", [])
+                if user_id in delivered_to:
+                    continue
+                delivered_to.append(user_id)
+                to_deliver.append(msg)
+            if to_deliver:
+                self._persist()
 
         for msg in to_deliver:
             try:
@@ -225,22 +266,28 @@ class ChatConnectionManager:
 
     async def broadcast_or_queue(self, channel_id: str, message: str, sender: WebSocket) -> None:
         """Entrega a mensagem a quem estiver conectado no canal (exceto o
-        remetente). Se ninguém mais estiver conectado, guarda na fila para
-        entrega quando o destinatário conectar."""
+        remetente), marcando cada um em 'delivered_to'. Se sobrar alguém do
+        canal que não estava conectado (ou a entrega falhar), a mensagem
+        também é guardada na fila para ser entregue quando essa pessoa
+        conectar — sem duplicar para quem já recebeu ao vivo."""
         async with self._ws_lock:
             conns = list(self.channels.get(channel_id, []))
             sender_id = self.connection_user.get(sender, "desconhecido")
-            others = [c for c in conns if c is not sender]
+            others = [(c, self.connection_user.get(c)) for c in conns if c is not sender]
 
-        delivered = False
-        for conn in others:
+        delivered_to_live = []
+        for conn, uid in others:
             try:
                 await conn.send_text(message)
-                delivered = True
+                if uid:
+                    delivered_to_live.append(uid)
             except Exception:
                 pass
 
-        if delivered:
+        # Só considera "totalmente entregue" (sem precisar de fila) quando
+        # havia pelo menos um outro participante conectado no canal e a
+        # entrega chegou em todos eles.
+        if others and len(delivered_to_live) == len(others):
             return
 
         async with self._ws_lock:
@@ -249,24 +296,35 @@ class ChatConnectionManager:
                 "sender_id": sender_id,
                 "payload": message,
                 "queued_at": datetime.now(timezone.utc).isoformat(),
+                "delivered_to": delivered_to_live,
             })
             if len(queue) > MESSAGE_QUEUE_MAX_PER_CHANNEL:
                 del queue[: len(queue) - MESSAGE_QUEUE_MAX_PER_CHANNEL]
+            self._persist()
 
     async def purge_expired(self) -> None:
         """Remove mensagens pendentes mais antigas que MESSAGE_QUEUE_HOURS."""
         now = datetime.now(timezone.utc)
+        changed = False
         async with self._ws_lock:
             for channel_id in list(self.pending.keys()):
                 fresh = []
                 for msg in self.pending[channel_id]:
                     queued_at = datetime.fromisoformat(msg["queued_at"])
+                    if queued_at.tzinfo is None:
+                        queued_at = queued_at.replace(tzinfo=timezone.utc)
                     if now - queued_at < timedelta(hours=MESSAGE_QUEUE_HOURS):
                         fresh.append(msg)
+                    else:
+                        changed = True
                 if fresh:
                     self.pending[channel_id] = fresh
                 else:
+                    if channel_id in self.pending:
+                        changed = True
                     self.pending.pop(channel_id, None)
+            if changed:
+                self._persist()
 
 
 chat_manager = ChatConnectionManager()
