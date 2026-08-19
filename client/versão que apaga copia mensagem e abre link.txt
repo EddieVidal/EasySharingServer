@@ -1,0 +1,1763 @@
+"""
+FileSend Messenger v2.1 - Chat Direto e Grupos
+----------------------------------------------
+Suporte a conexões simultâneas em segundo plano, notificações visuais/sonoras,
+gerenciamento completo de contatos, ícones customizados (lápis, lixeira e anexo) e tooltips estáveis.
+"""
+
+import os
+import sys
+import json
+import base64
+import io
+import re
+import uuid
+import webbrowser
+import tempfile
+import threading
+import time
+import hashlib
+import winreg
+import secrets
+import winsound
+import ctypes
+from pathlib import Path
+
+# ===== VERSÃO DO APLICATIVO =====
+APP_VERSION = " 2.2"  # atualize a cada release
+
+import customtkinter as ctk
+from tkinter import filedialog, messagebox, Menu
+from PIL import Image, ImageDraw, ImageChops
+import requests
+import websocket
+from requests_toolbelt.multipart.encoder import MultipartEncoder
+
+import crypto_utils
+
+# API Nativas do Windows para Notificação/Piscar Barra de Tarefas
+FLASHW_ALL = 3
+FLASHW_TIMERNOFG = 12
+
+class FLASHWINFO(ctypes.Structure):
+    _fields_ = [
+        ('cbSize', ctypes.c_uint),
+        ('hwnd', ctypes.c_void_p),
+        ('dwFlags', ctypes.c_uint),
+        ('uCount', ctypes.c_uint),
+        ('dwTimeout', ctypes.c_uint)
+    ]
+
+def flash_window(hwnd):
+    """Pisca o ícone do aplicativo na barra de tarefas do Windows."""
+    try:
+        finfo = FLASHWINFO()
+        finfo.cbSize = ctypes.sizeof(FLASHWINFO)
+        finfo.hwnd = hwnd
+        finfo.dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG
+        finfo.uCount = 5
+        finfo.dwTimeout = 0
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(finfo))
+    except Exception:
+        pass
+
+
+def get_resource_path(relative_path: str) -> Path:
+    """Obtém o caminho absoluto para recursos, compatível com PyInstaller."""
+    if hasattr(sys, '_MEIPASS'):
+        return Path(sys._MEIPASS) / relative_path
+    return Path(__file__).parent / relative_path
+
+
+# Armazenamento em AppData/EasySharing
+APPDATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "EasySharing"
+APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+
+CONFIG_PATH = APPDATA_DIR / "config.json"
+CONTACTS_PATH = APPDATA_DIR / "contacts.json"
+GROUPS_PATH = APPDATA_DIR / "groups.json"
+DEFAULT_CONFIG = {"server_url": "https://easyshare-ze6p.onrender.com"}
+GENERIC_UPLOAD_NAME = "arquivo.enc"
+
+
+def normalize_id(user_id: str) -> str:
+    clean = user_id.strip().upper()
+    if not clean.startswith("USER-"):
+        clean = f"USER-{clean}"
+    return clean
+
+
+def get_hardware_uuid() -> str:
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography",
+            0,
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+        )
+        value, _ = winreg.QueryValueEx(key, "MachineGuid")
+        winreg.CloseKey(key)
+        
+        if value:
+            short_hash = hashlib.sha256(value.encode()).hexdigest()[:8].upper()
+            return f"USER-{short_hash}"
+    except Exception:
+        pass
+    return "USER-" + secrets.token_hex(4).upper()
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return {**DEFAULT_CONFIG, **json.loads(CONFIG_PATH.read_text(encoding="utf-8"))}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(config: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def load_contacts() -> dict:
+    if CONTACTS_PATH.exists():
+        try:
+            return json.loads(CONTACTS_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_contacts(contacts: dict) -> None:
+    CONTACTS_PATH.write_text(json.dumps(contacts, indent=2), encoding="utf-8")
+
+
+def load_groups() -> dict:
+    if GROUPS_PATH.exists():
+        try:
+            return json.loads(GROUPS_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_groups(groups: dict) -> None:
+    GROUPS_PATH.write_text(json.dumps(groups, indent=2), encoding="utf-8")
+
+
+# ------------------------------------------------------------------
+# Persistência local do histórico de conversas (criptografado em disco)
+# ------------------------------------------------------------------
+MESSAGES_DIR = APPDATA_DIR / "messages"
+MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+# Regex simples para detectar URLs http(s) dentro de uma mensagem de texto
+URL_REGEX = re.compile(r'(https?://[^\s]+)')
+
+
+def _messages_file_path(target_key: str) -> Path:
+    safe = target_key.replace(":", "_").replace("/", "_")
+    return MESSAGES_DIR / f"{safe}.dat"
+
+
+def load_chat_history_from_disk(target_key: str, key: bytes) -> list:
+    """Carrega e decifra o histórico salvo localmente para uma conversa."""
+    path = _messages_file_path(target_key)
+    if not path.exists():
+        return []
+    try:
+        raw_payload = json.loads(path.read_text(encoding="utf-8"))
+        decrypted = crypto_utils.decrypt_text(raw_payload, key)
+        history = json.loads(decrypted)
+        return history if isinstance(history, list) else []
+    except Exception as exc:
+        print(f"Erro ao carregar histórico local de {target_key}: {exc}")
+        return []
+
+
+def save_chat_history_to_disk(target_key: str, key: bytes, history: list) -> None:
+    """Cifra e salva o histórico de uma conversa em disco (persiste entre sessões)."""
+    try:
+        payload = crypto_utils.encrypt_text(json.dumps(history, ensure_ascii=False), key)
+        _messages_file_path(target_key).write_text(json.dumps(payload), encoding="utf-8")
+    except Exception as exc:
+        print(f"Erro ao salvar histórico local de {target_key}: {exc}")
+
+
+def delete_chat_history_file(target_key: str) -> None:
+    """Remove o arquivo de histórico local de uma conversa do disco."""
+    try:
+        _messages_file_path(target_key).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def format_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def derive_channel_and_key(my_id: str, contact_id: str) -> tuple[str, bytes]:
+    id1 = normalize_id(my_id)
+    id2 = normalize_id(contact_id)
+    ids = sorted([id1, id2])
+    combined = f"{ids[0]}:{ids[1]}"
+    channel_id = hashlib.sha256(combined.encode()).hexdigest()[:16]
+    key = hashlib.sha256((combined + "_secret_salt").encode()).digest()
+    return channel_id, key
+
+
+# ------------------------------------------------------------------
+# Status (presença) e foto de perfil
+# ------------------------------------------------------------------
+STATUS_LABELS = {
+    "online": "Online",
+    "away": "Ausente",
+    "busy": "Ocupado",
+}
+STATUS_FROM_LABEL = {v: k for k, v in STATUS_LABELS.items()}
+
+AVATAR_DIR = APPDATA_DIR / "avatars"
+AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+MY_AVATAR_PATH = APPDATA_DIR / "my_avatar.jpg"
+AVATAR_SIZE = 128  # resolução salva em disco
+AVATAR_THUMB = 28  # resolução exibida na lista lateral
+MY_AVATAR_THUMB = 32
+
+
+def make_square_avatar(img: Image.Image, size: int = AVATAR_SIZE) -> Image.Image:
+    """Recorta a imagem no centro (quadrado) e redimensiona para `size`x`size`."""
+    img = img.convert("RGB")
+    w, h = img.size
+    m = min(w, h)
+    left = (w - m) // 2
+    top = (h - m) // 2
+    img = img.crop((left, top, left + m, top + m))
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def create_status_icon(status: str, size: int = 18) -> Image.Image:
+    """Cria um ícone de presença em PNG/RGBA usando Pillow."""
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    margin = max(1, size // 9)
+    box = (margin, margin, size - margin - 1, size - margin - 1)
+
+    if status == "online":
+        draw = ImageDraw.Draw(img)
+        draw.ellipse(box, fill="#2fb344")
+
+    elif status == "away":
+        outer = Image.new("L", (size, size), 0)
+        inner = Image.new("L", (size, size), 0)
+        outer_draw = ImageDraw.Draw(outer)
+        inner_draw = ImageDraw.Draw(inner)
+
+        outer_draw.ellipse(box, fill=255)
+
+        shift = max(3, size // 3)
+        inner_box = (
+            margin + shift,
+            margin - shift // 3,
+            size - margin + shift,
+            size - margin - shift // 3,
+        )
+        inner_draw.ellipse(inner_box, fill=255)
+
+        crescent = ImageChops.subtract(outer, inner)
+        color = Image.new("RGBA", (size, size), "#d9d9d9")
+        img = Image.composite(color, img, crescent)
+
+    elif status == "busy":
+        draw = ImageDraw.Draw(img)
+        draw.ellipse(box, fill="#d9453d")
+
+        bar_height = max(2, size // 5)
+        y1 = (size - bar_height) // 2
+        y2 = y1 + bar_height - 1
+        draw.rectangle(
+            (margin + 3, y1, size - margin - 3, y2),
+            fill="#ffffff"
+        )
+
+    elif status == "offline":
+        draw = ImageDraw.Draw(img)
+        draw.ellipse(box, fill="#808080")
+
+    return img
+
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+class CTkToolTip:
+    """Implementação ultra-estável de Dica Flutuante (Tooltip)."""
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip_window = None
+        self._id = None
+
+        self.widget.bind("<Enter>", self.schedule_show, add="+")
+        self.widget.bind("<Leave>", self.hide_tooltip, add="+")
+        self.widget.bind("<ButtonPress>", self.hide_tooltip, add="+")
+
+    def schedule_show(self, event=None):
+        self.unschedule()
+        self._id = self.widget.after(200, self.show_tooltip)
+
+    def unschedule(self):
+        if self._id:
+            self.widget.after_cancel(self._id)
+            self._id = None
+
+    def show_tooltip(self, event=None):
+        if self.tooltip_window or not self.text:
+            return
+
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + 30
+
+        self.tooltip_window = tw = ctk.CTkToplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.attributes("-topmost", True)
+
+        label = ctk.CTkLabel(
+            tw,
+            text=self.text,
+            font=ctk.CTkFont(size=11),
+            fg_color="#1f1f1f",
+            text_color="#ffffff",
+            corner_radius=4,
+            padx=6,
+            pady=3
+        )
+        label.pack()
+
+    def hide_tooltip(self, event=None):
+        self.unschedule()
+        if self.tooltip_window:
+            try:
+                self.tooltip_window.destroy()
+            except Exception:
+                pass
+            self.tooltip_window = None
+
+
+class ContactDialog(ctk.CTkToplevel):
+    def __init__(self, parent, title="Novo Contato", initial_name="", initial_id=""):
+        super().__init__(parent)
+        self.result = None
+        self.title(title)
+        self.geometry("380x230")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.attributes("-topmost", True)
+        self.grab_set()
+
+        ctk.CTkLabel(self, text=title, font=ctk.CTkFont(weight="bold")).pack(pady=(15, 10))
+        
+        self.name_entry = ctk.CTkEntry(self, placeholder_text="Nome (ex: Fernanda)", width=320)
+        self.name_entry.pack(pady=5)
+        if initial_name:
+            self.name_entry.insert(0, initial_name)
+
+        self.id_entry = ctk.CTkEntry(self, placeholder_text="ID do Contato (ex: USER-XXXX)", width=320)
+        self.id_entry.pack(pady=5)
+        if initial_id:
+            self.id_entry.insert(0, initial_id)
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=15)
+        ctk.CTkButton(btn_frame, text="Cancelar", width=100, fg_color="gray", command=self.destroy).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Salvar", width=100, command=self._on_save).pack(side="left", padx=5)
+
+    def _on_save(self):
+        name = self.name_entry.get().strip()
+        contact_id = normalize_id(self.id_entry.get().strip())
+        if not name or not contact_id:
+            messagebox.showwarning("Campos Obrigatórios", "Por favor, preencha o Nome e o ID.", parent=self)
+            return
+        self.result = (name, contact_id)
+        self.destroy()
+
+
+class CreateGroupDialog(ctk.CTkToplevel):
+    def __init__(self, parent, contacts: dict):
+        super().__init__(parent)
+        self.result = None
+        self.contacts = contacts
+        self.title("Criar Novo Grupo")
+        self.geometry("400x380")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.attributes("-topmost", True)
+        self.grab_set()
+
+        ctk.CTkLabel(self, text="Criar Grupo", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(15, 5))
+        self.group_name_entry = ctk.CTkEntry(self, placeholder_text="Nome do Grupo (ex: Projeto X)", width=340)
+        self.group_name_entry.pack(pady=5)
+
+        ctk.CTkLabel(self, text="Selecione os Participantes:", font=ctk.CTkFont(size=12)).pack(pady=(10, 2))
+
+        self.scroll_frame = ctk.CTkScrollableFrame(self, width=320, height=160)
+        self.scroll_frame.pack(pady=5)
+
+        self.checkboxes = {}
+        for name, cid in contacts.items():
+            cb = ctk.CTkCheckBox(self.scroll_frame, text=f"{name} ({cid})")
+            cb.pack(anchor="w", pady=3, padx=5)
+            self.checkboxes[cid] = cb
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=15)
+        ctk.CTkButton(btn_frame, text="Cancelar", width=100, fg_color="gray", command=self.destroy).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Criar Grupo", width=110, command=self._on_create).pack(side="left", padx=5)
+
+    def _on_create(self):
+        gname = self.group_name_entry.get().strip()
+        selected_ids = [cid for cid, cb in self.checkboxes.items() if cb.get() == 1]
+        if not gname:
+            messagebox.showwarning("Aviso", "Preencha o nome do grupo.", parent=self)
+            return
+        if not selected_ids:
+            messagebox.showwarning("Aviso", "Selecione pelo menos um contato para formar o grupo.", parent=self)
+            return
+        self.result = (gname, selected_ids)
+        self.destroy()
+
+
+class FileSendMessenger(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.config_data = load_config()
+        self.contacts = load_contacts()
+        self.groups = load_groups()
+
+        self.active_chat_type: str | None = None
+        self.active_chat_target: str | None = None
+
+        self.connections: dict[str, dict] = {}
+        self.unread_counts: dict[str, int] = {}
+        self.chat_history: dict[str, list] = {}
+
+        # Status (presença) e fotos de perfil
+        self.my_status = self.config_data.get("status", "online")
+        if self.my_status not in STATUS_LABELS:
+            self.my_status = "online"
+        self.contact_status: dict[str, str] = {}
+        self.contact_avatar_photos: dict[str, ctk.CTkImage] = {}
+
+        self.my_avatar_bytes: bytes | None = None
+        if MY_AVATAR_PATH.exists():
+            try:
+                self.my_avatar_bytes = MY_AVATAR_PATH.read_bytes()
+            except OSError:
+                self.my_avatar_bytes = None
+        self.my_avatar_image: ctk.CTkImage | None = None
+        if self.my_avatar_bytes:
+            try:
+                img = Image.open(io.BytesIO(self.my_avatar_bytes))
+                self.my_avatar_image = ctk.CTkImage(light_image=img, dark_image=img, size=(MY_AVATAR_THUMB, MY_AVATAR_THUMB))
+            except Exception:
+                self.my_avatar_image = None
+
+        if "my_id" not in self.config_data or not self.config_data["my_id"].startswith("USER-"):
+            self.config_data["my_id"] = get_hardware_uuid()
+            save_config(self.config_data)
+
+        self.my_id = self.config_data["my_id"]
+
+        # Restaura as conversas salvas localmente (não se perdem mais ao fechar o app)
+        self._load_all_histories()
+
+        self.title(f"Easy Sharing — Chat V.{APP_VERSION} - Por Edson Vidal.")
+        self.geometry("950x660")
+        self.minsize(850, 600)
+
+        try:
+            icon_path = get_resource_path("icone.ico")
+            self.iconbitmap(icon_path)
+        except Exception as e:
+            print(f"Erro ao carregar ícone principal: {e}")
+
+        self._load_button_icons()
+        self._load_status_icons()
+        self._load_cached_contact_avatars()
+        self._build_layout()
+
+        self._sync_groups_from_server()
+        self._initialize_all_connections()
+        self._refresh_header_status()
+
+        self._wake_up_server()
+
+    def _load_all_histories(self):
+        """Carrega do disco o histórico de cada contato/grupo já cadastrado."""
+        for name, contact_id in self.contacts.items():
+            target_key = f"contact:{name}"
+            _, key = derive_channel_and_key(self.my_id, contact_id)
+            self.chat_history[target_key] = load_chat_history_from_disk(target_key, key)
+
+        for gid, ginfo in self.groups.items():
+            target_key = f"group:{gid}"
+            try:
+                key = base64.b64decode(ginfo["key"])
+            except Exception:
+                continue
+            self.chat_history[target_key] = load_chat_history_from_disk(target_key, key)
+
+    def _get_channel_key(self, target_key: str):
+        """Retorna a chave de cifra de um canal, mesmo sem conexão ativa no momento."""
+        conn = self.connections.get(target_key)
+        if conn and conn.get("key"):
+            return conn["key"]
+
+        if ":" not in target_key:
+            return None
+        chat_type, target = target_key.split(":", 1)
+        if chat_type == "contact" and target in self.contacts:
+            _, key = derive_channel_and_key(self.my_id, self.contacts[target])
+            return key
+        if chat_type == "group" and target in self.groups:
+            try:
+                return base64.b64decode(self.groups[target]["key"])
+            except Exception:
+                return None
+        return None
+
+    def _persist_history(self, target_key: str):
+        """Salva em disco (cifrado) o histórico atual de uma conversa."""
+        key = self._get_channel_key(target_key)
+        if key is None:
+            return
+        save_chat_history_to_disk(target_key, key, self.chat_history.get(target_key, []))
+
+    def _wake_up_server(self):
+        def worker():
+            server_url = self.config_data["server_url"].rstrip("/")
+            try:
+                requests.get(f"{server_url}/health", timeout=15)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _load_button_icons(self):
+        self.edit_icon = None
+        self.delete_icon = None
+        self.attach_icon = None
+        self.avatar_change_icon = None
+        self.default_avatar_icon = None
+
+        edit_path = get_resource_path("edit.png")
+        if edit_path.exists():
+            try:
+                edit_img = Image.open(edit_path)
+                self.edit_icon = ctk.CTkImage(light_image=edit_img, dark_image=edit_img, size=(18, 18))
+            except Exception as e:
+                print(f"Erro ao carregar edit.png: {e}")
+
+        delete_path = get_resource_path("delete.png")
+        if delete_path.exists():
+            try:
+                delete_img = Image.open(delete_path)
+                self.delete_icon = ctk.CTkImage(light_image=delete_img, dark_image=delete_img, size=(18, 18))
+            except Exception as e:
+                print(f"Erro ao carregar delete.png: {e}")
+
+        attach_path = get_resource_path("attach.png")
+        if attach_path.exists():
+            try:
+                attach_img = Image.open(attach_path)
+                self.attach_icon = ctk.CTkImage(light_image=attach_img, dark_image=attach_img, size=(18, 18))
+            except Exception as e:
+                print(f"Erro ao carregar attach.png: {e}")
+
+        fotos_path = get_resource_path("fotos.png")
+        if fotos_path.exists():
+            try:
+                fotos_img = Image.open(fotos_path)
+                self.avatar_change_icon = ctk.CTkImage(light_image=fotos_img, dark_image=fotos_img, size=(18, 18))
+            except Exception as e:
+                print(f"Erro ao carregar fotos.png: {e}")
+
+        user_path = get_resource_path("user.png")
+        if user_path.exists():
+            try:
+                user_img = Image.open(user_path)
+                self.default_avatar_icon = ctk.CTkImage(light_image=user_img, dark_image=user_img, size=(AVATAR_THUMB, AVATAR_THUMB))
+            except Exception as e:
+                print(f"Erro ao carregar user.png: {e}")
+
+    def _load_status_icons(self):
+        self.status_icons = {}
+
+        for status in ("online", "away", "busy", "offline"):
+            img = create_status_icon(status, 18)
+            self.status_icons[status] = ctk.CTkImage(
+                light_image=img,
+                dark_image=img,
+                size=(18, 18)
+            )
+
+    def _build_layout(self):
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.sidebar = ctk.CTkFrame(self, width=320, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        self.sidebar.grid_rowconfigure(4, weight=1)
+
+        ctk.CTkLabel(self.sidebar, text="💬 Easy Sharing Chat", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(15, 5), padx=15, anchor="w")
+
+        my_id_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        my_id_frame.pack(fill="x", padx=15, pady=2)
+
+        avatar_kwargs = {
+            "master": my_id_frame, "width": MY_AVATAR_THUMB, "height": MY_AVATAR_THUMB,
+            "corner_radius": MY_AVATAR_THUMB // 2, "command": self._toggle_avatar_menu,
+        }
+        if self.my_avatar_image:
+            avatar_kwargs.update({"text": "", "image": self.my_avatar_image, "fg_color": "gray25", "hover_color": "gray35"})
+        elif self.default_avatar_icon:
+            avatar_kwargs.update({"text": "", "image": self.default_avatar_icon, "fg_color": "gray25", "hover_color": "gray35"})
+        else:
+            avatar_kwargs.update({"text": "🙂", "fg_color": "gray25", "hover_color": "gray35"})
+        self.my_avatar_btn = ctk.CTkButton(**avatar_kwargs)
+        self.my_avatar_btn.pack(side="left", padx=(0, 6))
+        CTkToolTip(self.my_avatar_btn, "Alterar / remover foto")
+
+        id_col = ctk.CTkFrame(my_id_frame, fg_color="transparent")
+        id_col.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(id_col, text=f"Meu ID: {self.my_id}", font=ctk.CTkFont(size=11), text_color="gray").pack(anchor="w")
+
+        self.status_button = ctk.CTkButton(
+            id_col,
+            text=f"{STATUS_LABELS[self.my_status]}  ▾",
+            image=self.status_icons[self.my_status],
+            compound="left",
+            anchor="w",
+            width=140,
+            height=24,
+            font=ctk.CTkFont(size=10),
+            fg_color="transparent",
+            hover_color="gray30",
+            command=self._toggle_status_menu
+        )
+        self.status_button.pack(anchor="w", pady=(2, 0))
+
+        ctk.CTkButton(my_id_frame, text="Copiar", width=50, height=20, font=ctk.CTkFont(size=10), command=self._copy_my_id).pack(side="right", anchor="n")
+
+        btn_bar = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=15, pady=8)
+        ctk.CTkButton(btn_bar, text="+ Contato", width=130, command=self._add_contact).pack(side="left", padx=(0, 5))
+        ctk.CTkButton(btn_bar, text="+ Grupo", width=130, fg_color="#2b719e", command=self._create_group).pack(side="right")
+
+        self.search_entry = ctk.CTkEntry(self.sidebar, placeholder_text="🔍 Buscar Contato/Grupo...", justify="center")
+        self.search_entry.pack(pady=5, padx=15, fill="x")
+        self.search_entry.bind("<KeyRelease>", lambda e: self._render_sidebar_list())
+
+        self.sidebar_scroll = ctk.CTkScrollableFrame(self.sidebar, label_text="Conversas & Grupos")
+        self.sidebar_scroll.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+
+        self.chat_area = ctk.CTkFrame(self, fg_color="transparent")
+        self.chat_area.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        self.chat_area.grid_rowconfigure(1, weight=1)
+        self.chat_area.grid_columnconfigure(0, weight=1)
+
+        header_frame = ctk.CTkFrame(self.chat_area, fg_color="transparent")
+        header_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(5, 10))
+        header_frame.grid_columnconfigure(0, weight=1)
+
+        self.chat_header = ctk.CTkLabel(header_frame, text="Selecione uma Conversa.", font=ctk.CTkFont(size=16, weight="bold"))
+        self.chat_header.grid(row=0, column=0, sticky="w")
+
+        status_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        status_frame.grid(row=0, column=1, sticky="e")
+        self.status_dot = ctk.CTkLabel(status_frame, text="●", font=ctk.CTkFont(size=14), text_color="gray", width=16)
+        self.status_dot.pack(side="left")
+        self.status_text = ctk.CTkLabel(status_frame, text="", font=ctk.CTkFont(size=11), text_color="gray")
+        self.status_text.pack(side="left", padx=(2, 0))
+
+        delete_chat_kwargs = {
+            "master": header_frame, "width": 34, "height": 26,
+            "fg_color": "transparent", "hover_color": "#5c2626",
+            "state": "disabled", "command": self._delete_entire_conversation,
+        }
+        if self.delete_icon:
+            delete_chat_kwargs.update({"text": "", "image": self.delete_icon})
+        else:
+            delete_chat_kwargs.update({"text": "🗑️"})
+        self.delete_chat_btn = ctk.CTkButton(**delete_chat_kwargs)
+        self.delete_chat_btn.grid(row=0, column=2, sticky="e", padx=(8, 0))
+        CTkToolTip(self.delete_chat_btn, "Apagar conversa inteira")
+
+        self.channel_debug_label = ctk.CTkLabel(header_frame, text="", font=ctk.CTkFont(size=10), text_color="gray50")
+        self.channel_debug_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+        self.msg_scroll = ctk.CTkScrollableFrame(self.chat_area)
+        self.msg_scroll.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        input_frame = ctk.CTkFrame(self.chat_area)
+        input_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+        input_frame.grid_columnconfigure(1, weight=1)
+
+        attach_kwargs = {
+            "master": input_frame,
+            "width": 40,
+            "command": self._attach_and_send_file,
+            "state": "disabled"
+        }
+        if self.attach_icon:
+            attach_kwargs.update({"text": "", "image": self.attach_icon, "fg_color": "transparent", "hover_color": "gray30"})
+        else:
+            attach_kwargs.update({"text": "📎"})
+
+        self.attach_btn = ctk.CTkButton(**attach_kwargs)
+        self.attach_btn.grid(row=0, column=0, padx=5, pady=5)
+        CTkToolTip(self.attach_btn, "Enviar Arquivo")
+
+        self.msg_entry = ctk.CTkEntry(input_frame, placeholder_text="Digite sua mensagem...", state="disabled")
+        self.msg_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        self.msg_entry.bind("<Return>", lambda e: self._send_message())
+
+        self.send_btn = ctk.CTkButton(input_frame, text="Enviar", width=70, command=self._send_message, state="disabled")
+        self.send_btn.grid(row=0, column=2, padx=5, pady=5)
+
+        self._render_sidebar_list()
+
+    def _copy_my_id(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.my_id)
+        messagebox.showinfo("Copiado", f"Seu ID foi copiado:\n{self.my_id}")
+
+    def _update_status_button_label(self, expanded: bool = False):
+        arrow = "▴" if expanded else "▾"
+        self.status_button.configure(
+            text=f"{STATUS_LABELS[self.my_status]}  {arrow}",
+            image=self.status_icons[self.my_status]
+        )
+
+    def _toggle_status_menu(self):
+        if getattr(self, "_status_popup", None) is not None:
+            self._close_status_menu()
+            return
+
+        popup = ctk.CTkToplevel(self)
+        self._status_popup = popup
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+
+        x = self.status_button.winfo_rootx()
+        y = self.status_button.winfo_rooty() + self.status_button.winfo_height()
+        popup.geometry(f"155x105+{x}+{y}")
+
+        frame = ctk.CTkFrame(
+            popup,
+            corner_radius=4,
+            border_width=1,
+            border_color="gray40"
+        )
+        frame.pack(fill="both", expand=True)
+
+        for status in ("online", "away", "busy"):
+            button = ctk.CTkButton(
+                frame,
+                text=STATUS_LABELS[status],
+                image=self.status_icons[status],
+                compound="left",
+                anchor="w",
+                height=30,
+                fg_color="transparent",
+                hover_color="gray30",
+                font=ctk.CTkFont(size=10),
+                command=lambda s=status: self._select_status(s)
+            )
+            button.pack(fill="x", padx=2, pady=1)
+
+        self._update_status_button_label(expanded=True)
+
+        popup.bind("<FocusOut>", lambda event: self._close_status_menu())
+        popup.focus_force()
+
+    def _close_status_menu(self):
+        popup = getattr(self, "_status_popup", None)
+        if popup is not None:
+            try:
+                popup.destroy()
+            except Exception:
+                pass
+            self._status_popup = None
+        self._update_status_button_label(expanded=False)
+
+    def _select_status(self, status: str):
+        if status not in STATUS_LABELS:
+            return
+
+        self.my_status = status
+        self.config_data["status"] = status
+        save_config(self.config_data)
+
+        self._close_status_menu()
+        self._broadcast_my_status()
+
+    def _on_status_change(self, label: str):
+        status = STATUS_FROM_LABEL.get(label, "online")
+        self.my_status = status
+        self.config_data["status"] = status
+        save_config(self.config_data)
+        self._broadcast_my_status()
+
+    def _broadcast_my_status(self):
+        msg = json.dumps({"type": "presence", "status": self.my_status, "sender": self.my_id})
+        for conn in list(self.connections.values()):
+            if conn.get("type") == "contact" and conn.get("connected") and conn.get("ws"):
+                try:
+                    conn["ws"].send(msg)
+                except Exception:
+                    pass
+
+    def _on_presence_received(self, target_key: str, status: str):
+        if status not in ("online", "away", "busy", "offline"):
+            status = "offline"
+        self.contact_status[target_key] = status
+        self._render_sidebar_list()
+
+    def _mark_contact_possibly_offline(self, target_key: str):
+        self.contact_status[target_key] = "offline"
+        self._render_sidebar_list()
+
+    def _avatar_cache_path(self, target_key: str) -> Path:
+        safe = target_key.replace(":", "_").replace("/", "_")
+        return AVATAR_DIR / f"{safe}.jpg"
+
+    def _load_cached_contact_avatars(self):
+        for name in self.contacts.keys():
+            self._load_avatar_from_cache("contact", name)
+
+    def _load_avatar_from_cache(self, chat_type: str, target: str):
+        target_key = f"{chat_type}:{target}"
+        path = self._avatar_cache_path(target_key)
+        if path.exists():
+            try:
+                img = Image.open(path)
+                self.contact_avatar_photos[target_key] = ctk.CTkImage(light_image=img, dark_image=img, size=(AVATAR_THUMB, AVATAR_THUMB))
+            except Exception:
+                pass
+
+    def _toggle_avatar_menu(self):
+        if getattr(self, "_avatar_popup", None) is not None:
+            self._close_avatar_menu()
+            return
+
+        popup = ctk.CTkToplevel(self)
+        self._avatar_popup = popup
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+
+        x = self.my_avatar_btn.winfo_rootx()
+        y = self.my_avatar_btn.winfo_rooty() + self.my_avatar_btn.winfo_height()
+        has_photo = bool(self.my_avatar_bytes)
+        popup.geometry(f"170x{75 if has_photo else 42}+{x}+{y}")
+
+        frame = ctk.CTkFrame(popup, corner_radius=4, border_width=1, border_color="gray40")
+        frame.pack(fill="both", expand=True)
+
+        change_kwargs = {
+            "master": frame, "text": "Alterar foto", "anchor": "w", "height": 30,
+            "fg_color": "transparent", "hover_color": "gray30", "font": ctk.CTkFont(size=10),
+            "command": self._on_avatar_menu_change,
+        }
+        if self.avatar_change_icon:
+            change_kwargs.update({"image": self.avatar_change_icon, "compound": "left"})
+        else:
+            change_kwargs["text"] = "🖼️  Alterar foto"
+        ctk.CTkButton(**change_kwargs).pack(fill="x", padx=2, pady=1)
+
+        if has_photo:
+            remove_kwargs = {
+                "master": frame, "text": "Remover foto", "anchor": "w", "height": 30,
+                "fg_color": "transparent", "hover_color": "#5c2626", "font": ctk.CTkFont(size=10),
+                "command": self._on_avatar_menu_remove,
+            }
+            if self.delete_icon:
+                remove_kwargs.update({"image": self.delete_icon, "compound": "left"})
+            else:
+                remove_kwargs["text"] = "🗑️  Remover foto"
+            ctk.CTkButton(**remove_kwargs).pack(fill="x", padx=2, pady=1)
+
+        popup.bind("<FocusOut>", lambda event: self._close_avatar_menu())
+        popup.focus_force()
+
+    def _close_avatar_menu(self):
+        popup = getattr(self, "_avatar_popup", None)
+        if popup is not None:
+            try:
+                popup.destroy()
+            except Exception:
+                pass
+            self._avatar_popup = None
+
+    def _on_avatar_menu_change(self):
+        self._close_avatar_menu()
+        self._pick_profile_photo()
+
+    def _on_avatar_menu_remove(self):
+        self._close_avatar_menu()
+        self._remove_profile_photo()
+
+    def _pick_profile_photo(self):
+        path = filedialog.askopenfilename(
+            title="Escolher foto de perfil",
+            filetypes=[("Imagens", "*.png *.jpg *.jpeg *.webp *.bmp")]
+        )
+        if not path:
+            return
+        try:
+            img = Image.open(path)
+            square = make_square_avatar(img, AVATAR_SIZE)
+            square.save(MY_AVATAR_PATH, format="JPEG", quality=82)
+            self.my_avatar_bytes = MY_AVATAR_PATH.read_bytes()
+            self.my_avatar_image = ctk.CTkImage(light_image=square, dark_image=square, size=(MY_AVATAR_THUMB, MY_AVATAR_THUMB))
+            self.my_avatar_btn.configure(image=self.my_avatar_image, text="")
+            self._broadcast_my_avatar()
+            messagebox.showinfo("Foto atualizada", "Sua foto de perfil foi atualizada e enviada aos contatos conectados agora.")
+        except Exception as exc:
+            messagebox.showerror("Erro", f"Não foi possível carregar a imagem: {exc}")
+
+    def _broadcast_my_avatar(self):
+        if not self.my_avatar_bytes:
+            return
+        b64 = base64.b64encode(self.my_avatar_bytes).decode("ascii")
+        for conn in list(self.connections.values()):
+            if conn.get("type") == "contact" and conn.get("connected") and conn.get("ws"):
+                try:
+                    payload = crypto_utils.encrypt_text(b64, conn["key"])
+                    conn["ws"].send(json.dumps({"type": "profile_photo", "payload": payload, "sender": self.my_id}))
+                except Exception:
+                    pass
+
+    def _on_avatar_received(self, target_key: str, raw_bytes: bytes):
+        try:
+            path = self._avatar_cache_path(target_key)
+            path.write_bytes(raw_bytes)
+            img = Image.open(path)
+            self.contact_avatar_photos[target_key] = ctk.CTkImage(light_image=img, dark_image=img, size=(AVATAR_THUMB, AVATAR_THUMB))
+            self._render_sidebar_list()
+        except Exception as exc:
+            print(f"Erro ao salvar avatar recebido de {target_key}: {exc}")
+
+    def _remove_profile_photo(self):
+        if not self.my_avatar_bytes:
+            messagebox.showinfo("Sem foto", "Você ainda não definiu uma foto de perfil.")
+            return
+
+        if not messagebox.askyesno(
+            "Remover foto",
+            "Deseja remover sua foto de perfil?\nOs contatos conectados agora serão avisados e "
+            "apagarão a cópia que têm salva."
+        ):
+            return
+
+        try:
+            if MY_AVATAR_PATH.exists():
+                MY_AVATAR_PATH.unlink()
+        except OSError:
+            pass
+
+        self.my_avatar_bytes = None
+        self.my_avatar_image = None
+        if self.default_avatar_icon:
+            self.my_avatar_btn.configure(image=self.default_avatar_icon, text="")
+        else:
+            self.my_avatar_btn.configure(image=None, text="🙂")
+        self._broadcast_remove_avatar()
+
+    def _broadcast_remove_avatar(self):
+        msg = json.dumps({"type": "profile_photo_removed", "sender": self.my_id})
+        for conn in list(self.connections.values()):
+            if conn.get("type") == "contact" and conn.get("connected") and conn.get("ws"):
+                try:
+                    conn["ws"].send(msg)
+                except Exception:
+                    pass
+
+    def _on_avatar_removed(self, target_key: str):
+        self.contact_avatar_photos.pop(target_key, None)
+        try:
+            self._avatar_cache_path(target_key).unlink(missing_ok=True)
+        except Exception:
+            pass
+        self._render_sidebar_list()
+
+    def _add_contact(self):
+        dialog = ContactDialog(self, title="Novo Contato")
+        self.wait_window(dialog)
+        if dialog.result:
+            name, contact_id = dialog.result
+            self.contacts[name] = contact_id
+            save_contacts(self.contacts)
+            self._start_single_connection("contact", name)
+            self._render_sidebar_list()
+
+    def _edit_contact(self, old_name: str):
+        old_id = self.contacts.get(old_name, "")
+        dialog = ContactDialog(self, title="Editar Contato", initial_name=old_name, initial_id=old_id)
+        self.wait_window(dialog)
+        if dialog.result:
+            new_name, new_id = dialog.result
+            
+            old_key = f"contact:{old_name}"
+            self._close_connection(old_key)
+            del self.contacts[old_name]
+
+            new_key = f"contact:{new_name}"
+            if old_key in self.chat_history:
+                self.chat_history[new_key] = self.chat_history.pop(old_key)
+            if old_key in self.unread_counts:
+                self.unread_counts[new_key] = self.unread_counts.pop(old_key)
+            if old_key in self.contact_status:
+                self.contact_status[new_key] = self.contact_status.pop(old_key)
+            if old_key in self.contact_avatar_photos:
+                self.contact_avatar_photos[new_key] = self.contact_avatar_photos.pop(old_key)
+            old_avatar_path = self._avatar_cache_path(old_key)
+            if old_avatar_path.exists():
+                try:
+                    old_avatar_path.replace(self._avatar_cache_path(new_key))
+                except OSError:
+                    pass
+
+            self.contacts[new_name] = new_id
+            save_contacts(self.contacts)
+
+            if self.active_chat_type == "contact" and self.active_chat_target == old_name:
+                self.active_chat_target = new_name
+
+            self._start_single_connection("contact", new_name)
+            self._render_sidebar_list()
+
+    def _delete_contact(self, name: str):
+        if messagebox.askyesno("Excluir Contato", f"Tem certeza que deseja remover {name}?", parent=self):
+            target_key = f"contact:{name}"
+            self._close_connection(target_key)
+
+            if name in self.contacts:
+                del self.contacts[name]
+                save_contacts(self.contacts)
+
+            self.chat_history.pop(target_key, None)
+            self.unread_counts.pop(target_key, None)
+            self.contact_status.pop(target_key, None)
+            self.contact_avatar_photos.pop(target_key, None)
+            try:
+                self._avatar_cache_path(target_key).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            if self.active_chat_type == "contact" and self.active_chat_target == name:
+                self.active_chat_type = None
+                self.active_chat_target = None
+                self.chat_header.configure(text="Selecione uma conversa.")
+                self.msg_entry.configure(state="disabled")
+                self.send_btn.configure(state="disabled")
+                self.attach_btn.configure(state="disabled")
+                self.delete_chat_btn.configure(state="disabled")
+                for widget in self.msg_scroll.winfo_children():
+                    widget.destroy()
+
+            self._render_sidebar_list()
+
+    def _create_group(self):
+        if not self.contacts:
+            messagebox.showinfo("Aviso", "Você precisa adicionar contatos primeiro para criar um grupo.")
+            return
+
+        dialog = CreateGroupDialog(self, self.contacts)
+        self.wait_window(dialog)
+
+        if dialog.result:
+            gname, selected_ids = dialog.result
+            members = [self.my_id] + selected_ids
+            server_url = self.config_data["server_url"].rstrip("/")
+
+            def worker():
+                try:
+                    res = requests.post(f"{server_url}/groups", json={"group_name": gname, "members": members}, timeout=10)
+                    res.raise_for_status()
+                    gdata = res.json()
+                    self.groups[gdata["group_id"]] = gdata
+                    save_groups(self.groups)
+                    self.after(0, lambda: self._start_single_connection("group", gdata["group_id"]))
+                    self.after(0, self._render_sidebar_list)
+                    self.after(0, lambda: messagebox.showinfo("Sucesso", f"Grupo '{gname}' criado com sucesso!"))
+                except Exception as exc:
+                    self.after(0, lambda: messagebox.showerror("Erro", f"Falha ao criar grupo no servidor: {exc}"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    def _sync_groups_from_server(self):
+        def worker():
+            try:
+                server_url = self.config_data["server_url"].rstrip("/")
+                res = requests.get(f"{server_url}/groups/{self.my_id}", timeout=10)
+                if res.status_code == 200:
+                    remote_groups = res.json()
+                    for g in remote_groups:
+                        gid = g["group_id"]
+                        if gid not in self.groups:
+                            self.groups[gid] = g
+                            self.after(0, lambda gid=gid: self._start_single_connection("group", gid))
+                    save_groups(self.groups)
+                    self.after(0, self._render_sidebar_list)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _render_sidebar_list(self):
+        for w in self.sidebar_scroll.winfo_children():
+            w.destroy()
+
+        query = self.search_entry.get().strip().lower()
+
+        # Renderizar Grupos
+        groups_to_show = {gid: g for gid, g in self.groups.items() if not query or query in g["name"].lower()}
+        if groups_to_show:
+            ctk.CTkLabel(self.sidebar_scroll, text="GRUPOS", font=ctk.CTkFont(size=11, weight="bold"), text_color="gray70").pack(anchor="w", pady=(5, 2))
+            for gid, ginfo in groups_to_show.items():
+                target_key = f"group:{gid}"
+                is_active = (self.active_chat_type == "group" and self.active_chat_target == gid)
+                unread = self.unread_counts.get(target_key, 0)
+                badge = f" 🔴 ({unread})" if unread > 0 else ""
+
+                btn = ctk.CTkButton(
+                    self.sidebar_scroll,
+                    text=f"👥 {ginfo['name']}{badge}",
+                    anchor="w",
+                    fg_color="#1f538d" if is_active else "transparent",
+                    command=lambda g=gid: self._select_chat("group", g)
+                )
+                btn.pack(fill="x", pady=1)
+
+        # Renderizar Contatos Direto
+        contacts_to_show = {k: v for k, v in self.contacts.items() if not query or query in k.lower()}
+        if contacts_to_show:
+            ctk.CTkLabel(self.sidebar_scroll, text="CONTATOS DIRETO", font=ctk.CTkFont(size=11, weight="bold"), text_color="gray70").pack(anchor="w", pady=(10, 2))
+            for name in contacts_to_show.keys():
+                target_key = f"contact:{name}"
+                item_frame = ctk.CTkFrame(self.sidebar_scroll, fg_color="transparent")
+                item_frame.pack(fill="x", pady=1)
+
+                is_active = (self.active_chat_type == "contact" and self.active_chat_target == name)
+                unread = self.unread_counts.get(target_key, 0)
+                badge = f" 🔴 ({unread})" if unread > 0 else ""
+
+                st = self.contact_status.get(target_key, "offline")
+                st_icon = self.status_icons.get(st, self.status_icons["offline"])
+                avatar_img = self.contact_avatar_photos.get(target_key, self.default_avatar_icon)
+
+                # Container principal do botão do contato
+                btn_container = ctk.CTkFrame(
+                    item_frame, 
+                    fg_color="#1f538d" if is_active else "transparent",
+                    corner_radius=6
+                )
+                btn_container.pack(side="left", fill="x", expand=True)
+
+                # 1. Foto de perfil à esquerda
+                if avatar_img:
+                    avatar_lbl = ctk.CTkLabel(btn_container, text="", image=avatar_img)
+                    avatar_lbl.pack(side="left", padx=(5, 3), pady=3)
+                    avatar_lbl.bind("<Button-1>", lambda e, n=name: self._select_chat("contact", n))
+
+                # 2. Ícone de status (bolinha verde, lua, ocupado ou cinza)
+                status_lbl = ctk.CTkLabel(btn_container, text="", image=st_icon)
+                status_lbl.pack(side="left", padx=(2, 5), pady=3)
+                status_lbl.bind("<Button-1>", lambda e, n=name: self._select_chat("contact", n))
+
+                # 3. Nome do contato e badge de não lidas
+                name_lbl = ctk.CTkLabel(
+                    btn_container, 
+                    text=f"{name}{badge}", 
+                    anchor="w", 
+                    font=ctk.CTkFont(size=13)
+                )
+                name_lbl.pack(side="left", fill="x", expand=True, padx=(0, 5), pady=3)
+                name_lbl.bind("<Button-1>", lambda e, n=name: self._select_chat("contact", n))
+
+                # Permite clicar no container em si para abrir a conversa
+                btn_container.bind("<Button-1>", lambda e, n=name: self._select_chat("contact", n))
+
+                # Botão Editar
+                btn_edit_kwargs = {
+                    "master": item_frame,
+                    "width": 28,
+                    "height": 28,
+                    "command": lambda n=name: self._edit_contact(n)
+                }
+                if self.edit_icon:
+                    btn_edit_kwargs.update({"text": "", "image": self.edit_icon, "fg_color": "transparent", "hover_color": "gray30"})
+                else:
+                    btn_edit_kwargs.update({"text": "✏️", "fg_color": "gray30", "hover_color": "gray40"})
+
+                btn_edit = ctk.CTkButton(**btn_edit_kwargs)
+                btn_edit.pack(side="right", padx=1)
+                CTkToolTip(btn_edit, "Editar Contato")
+
+                # Botão Excluir
+                btn_del_kwargs = {
+                    "master": item_frame,
+                    "width": 28,
+                    "height": 28,
+                    "command": lambda n=name: self._delete_contact(n)
+                }
+                if self.delete_icon:
+                    btn_del_kwargs.update({"text": "", "image": self.delete_icon, "fg_color": "transparent", "hover_color": "gray30"})
+                else:
+                    btn_del_kwargs.update({"text": "🗑️", "fg_color": "#8d1f1f", "hover_color": "#a82525"})
+
+                btn_del = ctk.CTkButton(**btn_del_kwargs)
+                btn_del.pack(side="right", padx=1)
+                CTkToolTip(btn_del, "Excluir Contato")
+
+    def _select_chat(self, chat_type: str, target: str):
+        self.active_chat_type = chat_type
+        self.active_chat_target = target
+        target_key = f"{chat_type}:{target}"
+
+        self.unread_counts[target_key] = 0
+        self._update_app_title()
+        self._render_sidebar_list()
+
+        if chat_type == "contact":
+            contact_id = self.contacts[target]
+            channel_id, _ = derive_channel_and_key(self.my_id, contact_id)
+            self.chat_header.configure(text=f"Conversa com {target}")
+            debug_info = f"Meu ID: {self.my_id} | ID Contato: {contact_id} | Canal: {channel_id}"
+        else:
+            ginfo = self.groups.get(target, {})
+            self.chat_header.configure(text=f"Grupo: {ginfo.get('name', 'Desconhecido')}")
+            debug_info = f"Meu ID: {self.my_id} | ID Grupo: {target}"
+
+        self.channel_debug_label.configure(text=debug_info)
+
+        conn_data = self.connections.get(target_key)
+        is_connected = conn_data and conn_data.get("connected", False)
+
+        if not is_connected:
+            self._start_single_connection(chat_type, target)
+
+        self._refresh_header_status()
+        state = "normal" if is_connected else "disabled"
+        self.msg_entry.configure(state=state)
+        self.send_btn.configure(state=state)
+        self.attach_btn.configure(state=state)
+
+        self.delete_chat_btn.configure(state="normal")
+        self._rerender_active_chat()
+
+    def _rerender_active_chat(self):
+        """Redesenha todas as bolhas da conversa ativa a partir do histórico em memória."""
+        for widget in self.msg_scroll.winfo_children():
+            widget.destroy()
+
+        if not self.active_chat_type or not self.active_chat_target:
+            return
+
+        target_key = f"{self.active_chat_type}:{self.active_chat_target}"
+        history = self.chat_history.get(target_key, [])
+        for item in history:
+            if item["type"] == "text":
+                self._add_chat_bubble(item["text"], item["is_me"], msg_id=item.get("id"), target_key=target_key, render_only=True)
+            elif item["type"] == "file":
+                self._add_file_bubble(item["code"], item["filename"], item["size"], item["is_me"], item.get("sender", ""), msg_id=item.get("id"), target_key=target_key, render_only=True)
+
+    def _initialize_all_connections(self):
+        for name in self.contacts.keys():
+            self._start_single_connection("contact", name)
+        for gid in self.groups.keys():
+            self._start_single_connection("group", gid)
+
+    def _start_single_connection(self, chat_type: str, target: str):
+        target_key = f"{chat_type}:{target}"
+        existing = self.connections.get(target_key)
+        if existing and existing.get("state") in ("connecting", "connected"):
+            return
+
+        if chat_type == "contact":
+            if target not in self.contacts:
+                return
+            contact_id = self.contacts[target]
+            channel_id, key = derive_channel_and_key(self.my_id, contact_id)
+        else:
+            if target not in self.groups:
+                return
+            ginfo = self.groups[target]
+            channel_id = target
+            key = base64.b64decode(ginfo["key"])
+
+        generation = (existing["generation"] + 1) if existing else 1
+        conn_entry = {
+            "ws": None,
+            "key": key,
+            "channel_id": channel_id,
+            "connected": False,
+            "state": "connecting",
+            "type": chat_type,
+            "target": target,
+            "generation": generation,
+        }
+        self.connections[target_key] = conn_entry
+
+        server_url = self.config_data["server_url"].rstrip("/")
+        ws_url = server_url.replace("https://", "wss://").replace("http://", "ws://") + f"/ws/{channel_id}"
+
+        def is_current() -> bool:
+            live = self.connections.get(target_key)
+            return bool(live) and live.get("generation") == generation
+
+        def on_message(ws, message):
+            if not is_current():
+                return
+            try:
+                data = json.loads(message)
+                sender = data.get("sender", "")
+                
+                if sender == self.my_id:
+                    return
+
+                if data.get("type") == "text":
+                    decrypted_text = crypto_utils.decrypt_text(data["payload"], key)
+                    msg_display = f"{sender}: {decrypted_text}" if (chat_type == "group" and sender) else decrypted_text
+                    self.after(0, lambda: self._handle_incoming_message(target_key, "text", text=msg_display, is_me=False))
+                
+                elif data.get("type") == "file":
+                    code = data["code"]
+                    filename = data["filename"]
+                    size = data["size"]
+                    self.after(0, lambda: self._handle_incoming_message(target_key, "file", code=code, filename=filename, size=size, is_me=False, sender=sender))
+
+                elif data.get("type") == "presence" and chat_type == "contact":
+                    status = data.get("status", "offline")
+                    self.after(0, lambda: self._on_presence_received(target_key, status))
+
+                elif data.get("type") == "profile_photo" and chat_type == "contact":
+                    b64 = crypto_utils.decrypt_text(data["payload"], key)
+                    raw = base64.b64decode(b64)
+                    self.after(0, lambda: self._on_avatar_received(target_key, raw))
+
+                elif data.get("type") == "profile_photo_removed" and chat_type == "contact":
+                    self.after(0, lambda: self._on_avatar_removed(target_key))
+
+                elif data.get("type") == "sync_request" and chat_type == "contact":
+                    try:
+                        ws.send(json.dumps({"type": "presence", "status": self.my_status, "sender": self.my_id}))
+                        if self.my_avatar_bytes:
+                            avatar_b64 = base64.b64encode(self.my_avatar_bytes).decode("ascii")
+                            avatar_payload = crypto_utils.encrypt_text(avatar_b64, key)
+                            ws.send(json.dumps({"type": "profile_photo", "payload": avatar_payload, "sender": self.my_id}))
+                        else:
+                            ws.send(json.dumps({"type": "profile_photo_removed", "sender": self.my_id}))
+                    except Exception:
+                        pass
+            except Exception as exc:
+                print(f"Erro ao processar mensagem em {target_key}: {exc}")
+
+        def on_open(ws):
+            if not is_current():
+                return
+            conn_entry["connected"] = True
+            conn_entry["state"] = "connected"
+            try:
+                ws.send(json.dumps({"type": "hello", "user_id": self.my_id}))
+                if chat_type == "contact":
+                    ws.send(json.dumps({"type": "presence", "status": self.my_status, "sender": self.my_id}))
+                    if self.my_avatar_bytes:
+                        b64 = base64.b64encode(self.my_avatar_bytes).decode("ascii")
+                        payload = crypto_utils.encrypt_text(b64, key)
+                        ws.send(json.dumps({"type": "profile_photo", "payload": payload, "sender": self.my_id}))
+                    else:
+                        ws.send(json.dumps({"type": "profile_photo_removed", "sender": self.my_id}))
+                    ws.send(json.dumps({"type": "sync_request", "sender": self.my_id}))
+            except Exception as exc:
+                print(f"Erro no handshake (hello/presença/avatar): {exc}")
+            if self.active_chat_type == chat_type and self.active_chat_target == target:
+                self.after(0, lambda: self.msg_entry.configure(state="normal"))
+                self.after(0, lambda: self.send_btn.configure(state="normal"))
+                self.after(0, lambda: self.attach_btn.configure(state="normal"))
+            self.after(0, self._refresh_header_status)
+
+        def on_error(ws, error):
+            if not is_current():
+                return
+            conn_entry["connected"] = False
+            conn_entry["state"] = "error"
+            self._last_error_detail = str(error)
+            self.after(0, self._refresh_header_status)
+
+        def on_close(ws, status_code, msg):
+            if not is_current():
+                return
+            conn_entry["connected"] = False
+            conn_entry["state"] = "disconnected"
+            self.after(0, self._refresh_header_status)
+            if chat_type == "contact":
+                self.after(0, lambda: self._mark_contact_possibly_offline(target_key))
+            self.after(5000, lambda: self._start_single_connection(chat_type, target))
+
+        def run():
+            ws = websocket.WebSocketApp(ws_url, on_message=on_message, on_open=on_open, on_error=on_error, on_close=on_close)
+            conn_entry["ws"] = ws
+            ws.run_forever(ping_interval=30, ping_timeout=10)
+
+        thread = threading.Thread(target=run, daemon=True)
+        conn_entry["thread"] = thread
+        thread.start()
+
+    def _close_connection(self, target_key: str):
+        if target_key in self.connections:
+            conn = self.connections.pop(target_key)
+            conn["generation"] = conn.get("generation", 0) + 1
+            if conn.get("ws"):
+                try:
+                    conn["ws"].close()
+                except Exception:
+                    pass
+
+    def _handle_incoming_message(self, target_key: str, msg_type: str, **kwargs):
+        if target_key not in self.chat_history:
+            self.chat_history[target_key] = []
+        
+        hist_item = {"id": uuid.uuid4().hex, "ts": time.time(), "type": msg_type, **kwargs}
+        self.chat_history[target_key].append(hist_item)
+        self._persist_history(target_key)
+
+        is_current_active = (
+            self.active_chat_type and self.active_chat_target and 
+            f"{self.active_chat_type}:{self.active_chat_target}" == target_key
+        )
+
+        if not is_current_active:
+            self.unread_counts[target_key] = self.unread_counts.get(target_key, 0) + 1
+            
+            try:
+                winsound.PlaySound("SystemNotification", winsound.SND_ALIAS | winsound.SND_ASYNC)
+            except Exception:
+                pass
+
+            try:
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+                if not hwnd:
+                    hwnd = self.winfo_id()
+                flash_window(hwnd)
+            except Exception:
+                pass
+
+            self._update_app_title()
+            self._render_sidebar_list()
+        else:
+            if msg_type == "text":
+                self._add_chat_bubble(kwargs["text"], kwargs["is_me"], msg_id=hist_item["id"], target_key=target_key, render_only=True)
+            elif msg_type == "file":
+                self._add_file_bubble(kwargs["code"], kwargs["filename"], kwargs["size"], kwargs["is_me"], kwargs.get("sender", ""), msg_id=hist_item["id"], target_key=target_key, render_only=True)
+
+    def _update_app_title(self):
+        total_unread = sum(self.unread_counts.values())
+        base_title = f"Easy Sharing — Chat V.{APP_VERSION} - Por Edson Vidal."
+        if total_unread > 0:
+            self.title(f"🔴 ({total_unread}) {base_title}")
+        else:
+            self.title(base_title)
+
+    def _refresh_header_status(self):
+        if self.active_chat_type and self.active_chat_target:
+            target_key = f"{self.active_chat_type}:{self.active_chat_target}"
+            conn = self.connections.get(target_key)
+            if conn and conn.get("connected"):
+                self._set_connection_status("connected")
+            elif conn and conn.get("state") == "error":
+                self._set_connection_status("error", getattr(self, "_last_error_detail", ""))
+            else:
+                self._set_connection_status("connecting")
+            return
+
+        total = len(self.connections)
+        connected = sum(1 for c in self.connections.values() if c.get("connected"))
+        if total == 0:
+            self.status_dot.configure(text_color="gray")
+            self.status_text.configure(text="")
+        elif connected > 0:
+            self.status_dot.configure(text_color="#2fb344")
+            self.status_text.configure(text=f"Servidor online ({connected}/{total})")
+        else:
+            self.status_dot.configure(text_color="#e2b93b")
+            self.status_text.configure(text="Conectando ao servidor...")
+
+    def _set_connection_status(self, status: str, detail: str = ""):
+        colors = {
+            "connecting": ("#e2b93b", "Conectando..."),
+            "connected": ("#2fb344", "Conectado"),
+            "disconnected": ("#8a8a8a", "Desconectado"),
+            "error": ("#d9453d", "Erro de conexão"),
+        }
+        color, label = colors.get(status, ("gray", ""))
+        self.status_dot.configure(text_color=color)
+        self.status_text.configure(text=f"{label}{(' — ' + detail) if detail else ''}")
+
+    def _send_message(self):
+        text = self.msg_entry.get().strip()
+        if not text or not self.active_chat_target or not self.active_chat_type:
+            return
+
+        target_key = f"{self.active_chat_type}:{self.active_chat_target}"
+        conn_data = self.connections.get(target_key)
+
+        if not conn_data or not conn_data.get("ws") or not conn_data.get("connected"):
+            messagebox.showwarning("Sem Conexão", "Aguarde a conexão deste chat ser estabelecida.")
+            return
+
+        self.msg_entry.delete(0, "end")
+        payload = crypto_utils.encrypt_text(text, conn_data["key"])
+        msg_data = json.dumps({"type": "text", "payload": payload, "sender": self.my_id})
+
+        try:
+            conn_data["ws"].send(msg_data)
+            if target_key not in self.chat_history:
+                self.chat_history[target_key] = []
+            msg_id = uuid.uuid4().hex
+            self.chat_history[target_key].append({"id": msg_id, "ts": time.time(), "type": "text", "text": text, "is_me": True})
+            self._persist_history(target_key)
+            self._add_chat_bubble(text, is_me=True, msg_id=msg_id, target_key=target_key, render_only=True)
+        except Exception as exc:
+            self._set_connection_status("error", str(exc))
+
+    @staticmethod
+    def _extract_first_url(text: str) -> str | None:
+        match = URL_REGEX.search(text)
+        if not match:
+            return None
+        # Remove pontuação de fechamento que costuma grudar no fim do link (. , ; ) ! ?)
+        return match.group(1).rstrip(').,;!?"\'')
+
+    def _copy_to_clipboard(self, text: str):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+
+    def _attach_bubble_context_menu(self, widgets, copy_text: str, url: str | None, msg_id: str | None, target_key: str | None):
+        """Cria e vincula um menu de botão direito (Copiar / Abrir link / Apagar) às bolhas."""
+        menu = Menu(self, tearoff=0)
+        menu.add_command(label="Copiar mensagem", command=lambda: self._copy_to_clipboard(copy_text))
+        if url:
+            menu.add_command(label="Copiar link", command=lambda u=url: self._copy_to_clipboard(u))
+            menu.add_command(label="Abrir link", command=lambda u=url: webbrowser.open(u))
+        if msg_id and target_key:
+            menu.add_separator()
+            menu.add_command(label="Apagar mensagem", command=lambda: self._delete_single_message(target_key, msg_id))
+
+        def show_menu(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        for widget in widgets:
+            widget.bind("<Button-3>", show_menu)
+
+    def _add_chat_bubble(self, text: str, is_me: bool, msg_id: str = None, target_key: str = None, render_only: bool = False):
+        bubble_frame = ctk.CTkFrame(self.msg_scroll, fg_color="#1f538d" if is_me else "#333333", corner_radius=10)
+        align = "e" if is_me else "w"
+        bubble_frame.pack(anchor=align, pady=4, padx=10)
+
+        url = self._extract_first_url(text)
+        label = ctk.CTkLabel(
+            bubble_frame, text=text, wraplength=420, justify="left",
+            cursor="hand2" if url else "arrow"
+        )
+        label.pack(padx=10, pady=(5, 2 if url else 5))
+
+        widgets_for_menu = [bubble_frame, label]
+
+        if url:
+            if url == text:
+                label.configure(text_color="#8ecbff")
+            label.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+
+            link_row = ctk.CTkFrame(bubble_frame, fg_color="transparent")
+            link_row.pack(fill="x", padx=10, pady=(0, 5))
+            link_btn = ctk.CTkButton(
+                link_row, text="🔗 Abrir link", height=22, width=100,
+                font=ctk.CTkFont(size=10),
+                fg_color="transparent", text_color="#5eb1ff", hover_color="gray30",
+                command=lambda u=url: webbrowser.open(u)
+            )
+            link_btn.pack(side="left")
+            copy_link_btn = ctk.CTkButton(
+                link_row, text="📋 Copiar link", height=22, width=100,
+                font=ctk.CTkFont(size=10),
+                fg_color="transparent", text_color="#5eb1ff", hover_color="gray30",
+                command=lambda u=url: self._copy_to_clipboard(u)
+            )
+            copy_link_btn.pack(side="left", padx=(4, 0))
+            widgets_for_menu.append(link_row)
+
+        self._attach_bubble_context_menu(widgets_for_menu, text, url, msg_id, target_key)
+        return bubble_frame
+
+    def _add_file_bubble(self, code: str, filename: str, size: int, is_me: bool, sender: str = "", msg_id: str = None, target_key: str = None, render_only: bool = False):
+        bubble_frame = ctk.CTkFrame(self.msg_scroll, fg_color="#1b4f3e" if is_me else "#2d4239", corner_radius=10)
+        align = "e" if is_me else "w"
+        bubble_frame.pack(anchor=align, pady=5, padx=10)
+
+        sender_prefix = f"[{sender}] " if (sender and not is_me and self.active_chat_type == "group") else ""
+        info_text = f"📁 {sender_prefix}Arquivo Recebido: {filename} ({format_size(size)})" if not is_me else f"📁 Arquivo Enviado: {filename} ({format_size(size)})"
+        info_label = ctk.CTkLabel(bubble_frame, text=info_text, font=ctk.CTkFont(weight="bold"))
+        info_label.pack(padx=10, pady=(5, 2))
+
+        btn = ctk.CTkButton(bubble_frame, text="⬇ Baixar e Decifrar", height=24, command=lambda c=code, fn=filename: self._download_attached_file(c, fn))
+        btn.pack(padx=10, pady=(2, 5))
+
+        self._attach_bubble_context_menu([bubble_frame, info_label], filename, None, msg_id, target_key)
+        return bubble_frame
+
+    def _delete_single_message(self, target_key: str, msg_id: str):
+        """Apaga apenas uma mensagem (localmente), estilo WhatsApp."""
+        if not messagebox.askyesno(
+            "Apagar mensagem",
+            "Apagar esta mensagem?\n(Remove apenas a sua cópia local, salva neste computador)"
+        ):
+            return
+        history = self.chat_history.get(target_key, [])
+        self.chat_history[target_key] = [m for m in history if m.get("id") != msg_id]
+        self._persist_history(target_key)
+
+        if self.active_chat_type and self.active_chat_target and f"{self.active_chat_type}:{self.active_chat_target}" == target_key:
+            self._rerender_active_chat()
+
+    def _delete_entire_conversation(self):
+        """Apaga toda a conversa ativa (mensagens em memória e o arquivo salvo em disco)."""
+        if not self.active_chat_type or not self.active_chat_target:
+            return
+
+        target_key = f"{self.active_chat_type}:{self.active_chat_target}"
+        if not messagebox.askyesno(
+            "Apagar conversa",
+            "Apagar toda esta conversa?\nAs mensagens salvas localmente serão removidas e isso não pode ser desfeito.",
+            icon="warning"
+        ):
+            return
+
+        self.chat_history[target_key] = []
+        delete_chat_history_file(target_key)
+        self.unread_counts[target_key] = 0
+
+        self._rerender_active_chat()
+        self._render_sidebar_list()
+
+    def _attach_and_send_file(self):
+        path = filedialog.askopenfilename(title="Selecione um arquivo para enviar")
+        if not path or not self.active_chat_target or not self.active_chat_type:
+            return
+
+        target_key = f"{self.active_chat_type}:{self.active_chat_target}"
+        conn_data = self.connections.get(target_key)
+
+        if not conn_data or not conn_data.get("ws") or not conn_data.get("connected"):
+            messagebox.showwarning("Sem Conexão", "Conexão inativa para este chat.")
+            return
+
+        def worker():
+            filename = os.path.basename(path)
+            server_url = self.config_data["server_url"].rstrip("/")
+            size = os.path.getsize(path)
+
+            key = crypto_utils.generate_key()
+            tmp_encrypted = tempfile.NamedTemporaryFile(delete=False, suffix=".enc")
+            tmp_encrypted.close()
+            enc_path = tmp_encrypted.name
+
+            try:
+                crypto_utils.encrypt_file(path, enc_path, key, filename)
+                with open(enc_path, "rb") as f:
+                    encoder = MultipartEncoder(fields={"file": (GENERIC_UPLOAD_NAME, f, "application/octet-stream")})
+                    response = requests.post(f"{server_url}/upload", data=encoder, headers={"Content-Type": encoder.content_type}, timeout=(20, 120))
+                response.raise_for_status()
+                code = response.json()["code"]
+
+                key_text = base64.urlsafe_b64encode(key).decode().rstrip("=")
+                full_code = f"{code}.{key_text}"
+                file_msg = json.dumps({"type": "file", "code": full_code, "filename": filename, "size": size, "sender": self.my_id})
+                
+                conn_data["ws"].send(file_msg)
+
+                if target_key not in self.chat_history:
+                    self.chat_history[target_key] = []
+                file_msg_id = uuid.uuid4().hex
+                self.chat_history[target_key].append({"id": file_msg_id, "ts": time.time(), "type": "file", "code": full_code, "filename": filename, "size": size, "is_me": True})
+                self._persist_history(target_key)
+
+                self.after(0, lambda: self._add_file_bubble(full_code, filename, size, True, msg_id=file_msg_id, target_key=target_key, render_only=True))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Erro", f"Falha ao enviar arquivo: {exc}"))
+            finally:
+                try:
+                    os.remove(enc_path)
+                except OSError:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _download_attached_file(self, full_code: str, original_filename: str):
+        save_path = filedialog.asksaveasfilename(initialfile=original_filename)
+        if not save_path:
+            return
+
+        def worker():
+            server_url = self.config_data["server_url"].rstrip("/")
+            if "." in full_code:
+                code, key_text = full_code.split(".", 1)
+                padding = "=" * (-len(key_text) % 4)
+                key = base64.urlsafe_b64decode(key_text + padding)
+            else:
+                code = full_code
+                target_key = f"{self.active_chat_type}:{self.active_chat_target}"
+                key = self.connections[target_key]["key"]
+
+            tmp_encrypted = tempfile.NamedTemporaryFile(delete=False, suffix=".enc")
+            tmp_encrypted.close()
+            enc_path = tmp_encrypted.name
+            tmp_decrypted_path = enc_path + ".dec"
+
+            try:
+                with requests.get(f"{server_url}/download/{code}", stream=True, timeout=(20, 60)) as response:
+                    response.raise_for_status()
+                    with open(enc_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=1024 * 128):
+                            if chunk:
+                                f.write(chunk)
+
+                crypto_utils.decrypt_file(enc_path, tmp_decrypted_path, key)
+                os.replace(tmp_decrypted_path, save_path)
+                self.after(0, lambda: messagebox.showinfo("Sucesso", f"Arquivo salvo em:\n{save_path}"))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Erro", f"Falha no download: {exc}"))
+            finally:
+                try:
+                    os.remove(enc_path)
+                except OSError:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+if __name__ == "__main__":
+    app = FileSendMessenger()
+    app.mainloop()
