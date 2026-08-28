@@ -1,9 +1,13 @@
 """
-FileSend Relay Server v2.0
+FileSend Relay Server v2.1
 --------------------------
 Servidor relay otimizado para plataformas de nuvem com suspensão automática (Render, Koyeb).
 Utiliza FileResponse para entregas HTTP com Content-Length garantido, suporte a CORS,
 e limpeza automática de arquivos de uso único.
+
+A fila de mensagens de chat pendentes (destinatário offline no envio) é persistida no
+Supabase (Postgres gerenciado), porque o disco local desses provedores é efêmero — some
+a cada redeploy, reinício ou "spin down" por inatividade do plano free.
 """
 
 import os
@@ -18,6 +22,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,35 +39,47 @@ CHUNK_SIZE = 1024 * 1024
 CODE_LENGTH = 6
 CODE_ALPHABET = "".join(c for c in (string.ascii_uppercase + string.digits) if c not in "0O1IL")
 
-# Fila de mensagens de chat não entregues (destinatário offline no momento do envio)
+# ------------------------------------------------------------------
+# Fila de mensagens de chat pendentes — persistida no Supabase
+# ------------------------------------------------------------------
 MESSAGE_QUEUE_HOURS = float(os.environ.get("MESSAGE_QUEUE_HOURS", "48"))
 MESSAGE_QUEUE_MAX_PER_CHANNEL = int(os.environ.get("MESSAGE_QUEUE_MAX_PER_CHANNEL", "50"))
-CHAT_QUEUE_FILE = STORAGE_DIR / "_chat_queue.json"
-_chat_queue_file_lock = threading.Lock()
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_TABLE = "pending_messages"
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
+
+if not SUPABASE_ENABLED:
+    print(
+        "[AVISO] SUPABASE_URL / SUPABASE_SERVICE_KEY não configurados: a fila de mensagens "
+        "pendentes vai funcionar só em memória e será perdida a cada reinício/sono do servidor."
+    )
+
+_http_client: httpx.AsyncClient | None = None
 
 
-def _load_chat_queue() -> dict:
-    """Carrega do disco a fila de mensagens pendentes, para sobreviver a reinícios do servidor
-    (importante em plataformas com suspensão automática como Render/Koyeb)."""
-    if CHAT_QUEUE_FILE.exists():
-        try:
-            return json.loads(CHAT_QUEUE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+async def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=15.0)
+    return _http_client
 
 
-def _save_chat_queue(data: dict) -> None:
-    with _chat_queue_file_lock:
-        try:
-            CHAT_QUEUE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except OSError as exc:
-            print(f"[chat queue] erro ao salvar fila em disco: {exc}")
+def _supabase_headers(extra: dict | None = None) -> dict:
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
 
 
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="FileSend Relay", version="2.0.0")
+app = FastAPI(title="FileSend Relay", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -209,20 +226,23 @@ class ChatConnectionManager:
     tamanho — nunca porque só um dos membros offline já reconectou — assim
     todo mundo que estava offline recebe a mensagem quando voltar.
 
-    A fila também é persistida em disco (_chat_queue.json), para sobreviver
-    a reinícios do servidor em plataformas com suspensão automática
-    (Render, Koyeb).
+    A fila é persistida na tabela `pending_messages` do Supabase (Postgres
+    real, não efêmero), pois o disco local do Render/Koyeb é apagado a cada
+    reinício, redeploy ou "spin down" por inatividade do plano free — testar
+    isso foi o que mostrou que guardar a fila só em arquivo local não é
+    confiável nessas plataformas.
+
+    Se SUPABASE_URL/SUPABASE_SERVICE_KEY não estiverem configurados, cai de
+    volta para uma fila em memória (não sobrevive a reinícios, mas o
+    servidor continua funcionando normalmente enquanto o processo estiver de pé).
     """
 
     def __init__(self):
         self.channels: dict[str, list[WebSocket]] = {}
         self.connection_user: dict[WebSocket, str] = {}
-        self.pending: dict[str, list[dict]] = _load_chat_queue()
+        # Usado só quando o Supabase não está configurado (modo de fallback).
+        self._memory_pending: dict[str, list[dict]] = {}
         self._ws_lock = asyncio.Lock()
-
-    def _persist(self) -> None:
-        # Sempre chamado a partir de um trecho já protegido por _ws_lock.
-        _save_chat_queue(self.pending)
 
     async def connect(self, channel_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -245,28 +265,21 @@ class ChatConnectionManager:
         reenvia duas vezes para quem já recebeu — importante em grupos)."""
         async with self._ws_lock:
             self.connection_user[websocket] = user_id
-            queued = self.pending.get(channel_id, [])
-            to_deliver = []
-            for msg in queued:
-                if msg.get("sender_id") == user_id:
-                    continue
-                delivered_to = msg.setdefault("delivered_to", [])
-                if user_id in delivered_to:
-                    continue
-                delivered_to.append(user_id)
-                to_deliver.append(msg)
-            if to_deliver:
-                self._persist()
 
-        for msg in to_deliver:
+        if SUPABASE_ENABLED:
+            to_deliver = await self._supabase_fetch_and_mark_delivered(channel_id, user_id)
+        else:
+            to_deliver = self._memory_fetch_and_mark_delivered(channel_id, user_id)
+
+        for payload in to_deliver:
             try:
-                await websocket.send_text(msg["payload"])
+                await websocket.send_text(payload)
             except Exception:
                 pass
 
     async def broadcast_or_queue(self, channel_id: str, message: str, sender: WebSocket) -> None:
         """Entrega a mensagem a quem estiver conectado no canal (exceto o
-        remetente), marcando cada um em 'delivered_to'. Se sobrar alguém do
+        remetente), marcando cada um como já recebido. Se sobrar alguém do
         canal que não estava conectado (ou a entrega falhar), a mensagem
         também é guardada na fila para ser entregue quando essa pessoa
         conectar — sem duplicar para quem já recebeu ao vivo."""
@@ -290,41 +303,154 @@ class ChatConnectionManager:
         if others and len(delivered_to_live) == len(others):
             return
 
-        async with self._ws_lock:
-            queue = self.pending.setdefault(channel_id, [])
-            queue.append({
-                "sender_id": sender_id,
-                "payload": message,
-                "queued_at": datetime.now(timezone.utc).isoformat(),
-                "delivered_to": delivered_to_live,
-            })
-            if len(queue) > MESSAGE_QUEUE_MAX_PER_CHANNEL:
-                del queue[: len(queue) - MESSAGE_QUEUE_MAX_PER_CHANNEL]
-            self._persist()
+        if SUPABASE_ENABLED:
+            await self._supabase_enqueue(channel_id, sender_id, message, delivered_to_live)
+        else:
+            self._memory_enqueue(channel_id, sender_id, message, delivered_to_live)
 
     async def purge_expired(self) -> None:
         """Remove mensagens pendentes mais antigas que MESSAGE_QUEUE_HOURS."""
+        if SUPABASE_ENABLED:
+            await self._supabase_purge_expired()
+        else:
+            self._memory_purge_expired()
+
+    # ----------------------------------------------------------------
+    # Backend: Supabase (persistente)
+    # ----------------------------------------------------------------
+    async def _supabase_fetch_and_mark_delivered(self, channel_id: str, user_id: str) -> list[str]:
+        client = await _get_http_client()
+        to_deliver: list[str] = []
+        try:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+                headers=_supabase_headers(),
+                params={
+                    "channel_id": f"eq.{channel_id}",
+                    "sender_id": f"neq.{user_id}",
+                    "order": "queued_at.asc",
+                    "select": "id,payload,delivered_to",
+                },
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+        except Exception as exc:
+            print(f"[supabase] erro ao buscar mensagens pendentes: {exc}")
+            return to_deliver
+
+        for row in rows:
+            delivered_to = row.get("delivered_to") or []
+            if user_id in delivered_to:
+                continue
+            to_deliver.append(row["payload"])
+            try:
+                await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+                    headers=_supabase_headers({"Prefer": "return=minimal"}),
+                    params={"id": f"eq.{row['id']}"},
+                    json={"delivered_to": delivered_to + [user_id]},
+                )
+            except Exception as exc:
+                print(f"[supabase] erro ao marcar mensagem {row.get('id')} como entregue: {exc}")
+
+        return to_deliver
+
+    async def _supabase_enqueue(self, channel_id: str, sender_id: str, message: str, delivered_to_live: list[str]) -> None:
+        client = await _get_http_client()
+        try:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+                headers=_supabase_headers({"Prefer": "return=minimal"}),
+                json={
+                    "channel_id": channel_id,
+                    "sender_id": sender_id,
+                    "payload": message,
+                    "delivered_to": delivered_to_live,
+                },
+            )
+        except Exception as exc:
+            print(f"[supabase] erro ao enfileirar mensagem: {exc}")
+            return
+
+        await self._supabase_enforce_channel_limit(client, channel_id)
+
+    async def _supabase_enforce_channel_limit(self, client: httpx.AsyncClient, channel_id: str) -> None:
+        try:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+                headers=_supabase_headers(),
+                params={
+                    "channel_id": f"eq.{channel_id}",
+                    "order": "queued_at.asc",
+                    "select": "id",
+                },
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            excedente = len(rows) - MESSAGE_QUEUE_MAX_PER_CHANNEL
+            if excedente > 0:
+                ids_antigos = ",".join(str(r["id"]) for r in rows[:excedente])
+                await client.delete(
+                    f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+                    headers=_supabase_headers(),
+                    params={"id": f"in.({ids_antigos})"},
+                )
+        except Exception as exc:
+            print(f"[supabase] erro ao aplicar limite de fila do canal {channel_id}: {exc}")
+
+    async def _supabase_purge_expired(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=MESSAGE_QUEUE_HOURS)
+        client = await _get_http_client()
+        try:
+            await client.delete(
+                f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+                headers=_supabase_headers(),
+                params={"queued_at": f"lt.{cutoff.isoformat()}"},
+            )
+        except Exception as exc:
+            print(f"[supabase] erro ao expurgar mensagens antigas: {exc}")
+
+    # ----------------------------------------------------------------
+    # Backend: memória (fallback quando o Supabase não está configurado)
+    # ----------------------------------------------------------------
+    def _memory_fetch_and_mark_delivered(self, channel_id: str, user_id: str) -> list[str]:
+        queued = self._memory_pending.get(channel_id, [])
+        to_deliver = []
+        for msg in queued:
+            if msg.get("sender_id") == user_id:
+                continue
+            delivered_to = msg.setdefault("delivered_to", [])
+            if user_id in delivered_to:
+                continue
+            delivered_to.append(user_id)
+            to_deliver.append(msg["payload"])
+        return to_deliver
+
+    def _memory_enqueue(self, channel_id: str, sender_id: str, message: str, delivered_to_live: list[str]) -> None:
+        queue = self._memory_pending.setdefault(channel_id, [])
+        queue.append({
+            "sender_id": sender_id,
+            "payload": message,
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+            "delivered_to": delivered_to_live,
+        })
+        if len(queue) > MESSAGE_QUEUE_MAX_PER_CHANNEL:
+            del queue[: len(queue) - MESSAGE_QUEUE_MAX_PER_CHANNEL]
+
+    def _memory_purge_expired(self) -> None:
         now = datetime.now(timezone.utc)
-        changed = False
-        async with self._ws_lock:
-            for channel_id in list(self.pending.keys()):
-                fresh = []
-                for msg in self.pending[channel_id]:
-                    queued_at = datetime.fromisoformat(msg["queued_at"])
-                    if queued_at.tzinfo is None:
-                        queued_at = queued_at.replace(tzinfo=timezone.utc)
-                    if now - queued_at < timedelta(hours=MESSAGE_QUEUE_HOURS):
-                        fresh.append(msg)
-                    else:
-                        changed = True
-                if fresh:
-                    self.pending[channel_id] = fresh
-                else:
-                    if channel_id in self.pending:
-                        changed = True
-                    self.pending.pop(channel_id, None)
-            if changed:
-                self._persist()
+        for channel_id in list(self._memory_pending.keys()):
+            fresh = []
+            for msg in self._memory_pending[channel_id]:
+                queued_at = datetime.fromisoformat(msg["queued_at"])
+                if queued_at.tzinfo is None:
+                    queued_at = queued_at.replace(tzinfo=timezone.utc)
+                if now - queued_at < timedelta(hours=MESSAGE_QUEUE_HOURS):
+                    fresh.append(msg)
+            if fresh:
+                self._memory_pending[channel_id] = fresh
+            else:
+                self._memory_pending.pop(channel_id, None)
 
 
 chat_manager = ChatConnectionManager()
@@ -341,6 +467,14 @@ async def _start_chat_queue_cleanup():
                 print(f"[chat cleanup] erro: {exc}")
 
     asyncio.create_task(loop())
+
+
+@app.on_event("shutdown")
+async def _close_http_client():
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
 
 
 @app.websocket("/ws/{channel_id}")
