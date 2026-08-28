@@ -358,7 +358,7 @@ class ChatConnectionManager:
     async def _supabase_enqueue(self, channel_id: str, sender_id: str, message: str, delivered_to_live: list[str]) -> None:
         client = await _get_http_client()
         try:
-            await client.post(
+            resp = await client.post(
                 f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
                 headers=_supabase_headers({"Prefer": "return=minimal"}),
                 json={
@@ -368,6 +368,7 @@ class ChatConnectionManager:
                     "delivered_to": delivered_to_live,
                 },
             )
+            resp.raise_for_status()
         except Exception as exc:
             print(f"[supabase] erro ao enfileirar mensagem: {exc}")
             return
@@ -390,11 +391,12 @@ class ChatConnectionManager:
             excedente = len(rows) - MESSAGE_QUEUE_MAX_PER_CHANNEL
             if excedente > 0:
                 ids_antigos = ",".join(str(r["id"]) for r in rows[:excedente])
-                await client.delete(
+                del_resp = await client.delete(
                     f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
                     headers=_supabase_headers(),
                     params={"id": f"in.({ids_antigos})"},
                 )
+                del_resp.raise_for_status()
         except Exception as exc:
             print(f"[supabase] erro ao aplicar limite de fila do canal {channel_id}: {exc}")
 
@@ -402,11 +404,12 @@ class ChatConnectionManager:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=MESSAGE_QUEUE_HOURS)
         client = await _get_http_client()
         try:
-            await client.delete(
+            resp = await client.delete(
                 f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
                 headers=_supabase_headers(),
                 params={"queued_at": f"lt.{cutoff.isoformat()}"},
             )
+            resp.raise_for_status()
         except Exception as exc:
             print(f"[supabase] erro ao expurgar mensagens antigas: {exc}")
 
