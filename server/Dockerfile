@@ -2,10 +2,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY requirements_server.txt requirements.txt
+COPY server/requirements_server.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY server/main.py .
 
 RUN mkdir -p /app/storage
 ENV STORAGE_DIR=/app/storage
@@ -16,3 +16,4 @@ ENV DELETE_AFTER_DOWNLOAD=true
 EXPOSE 8000
 
 CMD ["python", "main.py"]
+
