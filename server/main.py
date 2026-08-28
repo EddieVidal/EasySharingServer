@@ -520,7 +520,11 @@ class FileInfoResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "time": datetime.now(timezone.utc).isoformat(),
+        "message_queue": "supabase" if SUPABASE_ENABLED else "memory",
+    }
 
 
 @app.post("/upload", response_model=UploadResponse)
