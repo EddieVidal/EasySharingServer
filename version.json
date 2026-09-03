@@ -1,6 +1,6 @@
 {
-  "version": "1.1.0",
-  "download_url": "https://github.com/EddieVidal/easy-sharing/releases/download/v1.1.0/EasySharing.exe",
-  "sha256": "COLOQUE_AQUI_O_HASH_SHA256_DO_EXE_GERADO_NO_PASSO_5",
-  "changelog": "Historico local de conversas, apagar mensagens, links clicaveis e fila de mensagens offline."
+  "version": "2.3",
+  "download_url": "https://github.com/EddieVidal/EasySharingServer/releases/download/v2.3/Easy.Sharing.exe",
+  "sha256": "bcf17eb6e80de962e8398b0c92a06c4cf66528b0f747787f4be3fc05af445c42",
+  "changelog": "Historico local de conversas, apagar mensagens, links clicaveis, fila de mensagens offline e data e hora."
 }
