@@ -1,6 +1,6 @@
 {
-  "version": "2.3",
-  "download_url": "https://github.com/EddieVidal/EasySharingServer/releases/download/v2.3/Easy.Sharing.exe",
-  "sha256": "bcf17eb6e80de962e8398b0c92a06c4cf66528b0f747787f4be3fc05af445c42",
-  "changelog": "Historico local de conversas, apagar mensagens, links clicaveis, fila de mensagens offline e data e hora."
+  "version": "2.4",
+  "download_url": "https://github.com/EddieVidal/EasySharingServer/releases/download/v2.4/EasySharing.exe",
+  "sha256": "180e4beca56c98c85311e7ea3c91c1957c40607fbe836a9ef95eb5e7eb176d6c",
+  "changelog": "Correção de Bug de Atualização."
 }
