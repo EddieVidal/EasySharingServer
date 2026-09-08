@@ -5,9 +5,10 @@ Servidor relay otimizado para plataformas de nuvem com suspensão automática (R
 Utiliza FileResponse para entregas HTTP com Content-Length garantido, suporte a CORS,
 e limpeza automática de arquivos de uso único.
 
-A fila de mensagens de chat pendentes (destinatário offline no envio) é persistida no
-Supabase (Postgres gerenciado), porque o disco local desses provedores é efêmero — some
-a cada redeploy, reinício ou "spin down" por inatividade do plano free.
+A fila de mensagens de chat pendentes (destinatário offline no envio) e os arquivos
+enviados são persistidos no Supabase (Postgres + Storage), porque o disco local desses
+provedores é efêmero — some a cada redeploy, reinício ou "spin down" por inatividade
+do plano free.
 """
 
 import os
@@ -25,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
@@ -51,10 +52,21 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_TABLE = "pending_messages"
 SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
 
+# ------------------------------------------------------------------
+# Arquivos enviados — persistidos no Supabase Storage (bucket "files")
+# + tabela file_metadata (Postgres), pelo mesmo motivo da fila de chat:
+# o disco local (STORAGE_DIR / _metadata.json) some a cada spin down
+# ou redeploy do Render, o que causava 404 em downloads de arquivos
+# enviados antes do último restart do servidor.
+# ------------------------------------------------------------------
+SUPABASE_STORAGE_BUCKET = "files"
+FILE_METADATA_TABLE = "file_metadata"
+
 if not SUPABASE_ENABLED:
     print(
         "[AVISO] SUPABASE_URL / SUPABASE_SERVICE_KEY não configurados: a fila de mensagens "
-        "pendentes vai funcionar só em memória e será perdida a cada reinício/sono do servidor."
+        "pendentes vai funcionar só em memória e será perdida a cada reinício/sono do servidor, "
+        "e o upload/download de arquivos não vai funcionar."
     )
 
 _http_client: httpx.AsyncClient | None = None
@@ -76,6 +88,103 @@ def _supabase_headers(extra: dict | None = None) -> dict:
     if extra:
         headers.update(extra)
     return headers
+
+
+# ------------------------------------------------------------------
+# Helpers: Supabase Storage + tabela file_metadata
+# ------------------------------------------------------------------
+async def _supabase_storage_upload(path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+    client = await _get_http_client()
+    resp = await client.post(
+        f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{path}",
+        headers=_supabase_headers({"Content-Type": content_type}),
+        content=data,
+    )
+    resp.raise_for_status()
+
+
+async def _supabase_storage_download(path: str) -> bytes:
+    client = await _get_http_client()
+    resp = await client.get(
+        f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{path}",
+        headers=_supabase_headers(),
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+async def _supabase_storage_delete(path: str) -> None:
+    client = await _get_http_client()
+    try:
+        resp = await client.delete(
+            f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{path}",
+            headers=_supabase_headers(),
+        )
+        if resp.status_code >= 400:
+            print(f"[storage] erro ao apagar {path}: {resp.status_code} {resp.text}")
+    except Exception as exc:
+        print(f"[storage] erro ao apagar {path}: {exc}")
+
+
+async def _file_metadata_get(code: str) -> dict | None:
+    client = await _get_http_client()
+    resp = await client.get(
+        f"{SUPABASE_URL}/rest/v1/{FILE_METADATA_TABLE}",
+        headers=_supabase_headers(),
+        params={"code": f"eq.{code}", "select": "*"},
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
+async def _file_metadata_code_exists(code: str) -> bool:
+    return await _file_metadata_get(code) is not None
+
+
+async def _file_metadata_insert(row: dict) -> None:
+    client = await _get_http_client()
+    resp = await client.post(
+        f"{SUPABASE_URL}/rest/v1/{FILE_METADATA_TABLE}",
+        headers=_supabase_headers({"Prefer": "return=minimal"}),
+        json=row,
+    )
+    resp.raise_for_status()
+
+
+async def _file_metadata_delete(code: str) -> None:
+    client = await _get_http_client()
+    try:
+        resp = await client.delete(
+            f"{SUPABASE_URL}/rest/v1/{FILE_METADATA_TABLE}",
+            headers=_supabase_headers(),
+            params={"code": f"eq.{code}"},
+        )
+        if resp.status_code >= 400:
+            print(f"[file_metadata] erro ao apagar {code}: {resp.status_code} {resp.text}")
+    except Exception as exc:
+        print(f"[file_metadata] erro ao apagar {code}: {exc}")
+
+
+async def _file_metadata_purge_expired() -> None:
+    """Remove do bucket e da tabela os arquivos cujo expires_at já passou."""
+    client = await _get_http_client()
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/{FILE_METADATA_TABLE}",
+            headers=_supabase_headers(),
+            params={"expires_at": f"lt.{now}", "select": "code,storage_path"},
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception as exc:
+        print(f"[file_metadata] erro ao buscar expirados: {exc}")
+        return
+
+    for row in rows:
+        await _supabase_storage_delete(row["storage_path"])
+        await _file_metadata_delete(row["code"])
 
 
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -172,6 +281,9 @@ def _generate_code(existing: dict) -> str:
             return code
 
 
+# ------------------------------------------------------------------
+# Backend: Supabase (persistente)
+# ----------------------------------------------------------------
 def _cleanup_loop():
     while True:
         try:
@@ -203,6 +315,10 @@ def _delete_file(code: str, metadata: dict, save: bool = True) -> None:
         _save_metadata(metadata)
 
 
+# NOTA: _cleanup_loop/_load_metadata/_save_metadata/_generate_code/_delete_file acima
+# operavam sobre o disco local (STORAGE_DIR/_metadata.json) e não são mais usados pelos
+# endpoints de arquivo (migrados para Supabase Storage + file_metadata). Ficaram aqui
+# sem uso ativo; podem ser removidos com calma no futuro.
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
@@ -466,6 +582,11 @@ async def _start_chat_queue_cleanup():
                 await chat_manager.purge_expired()
             except Exception as exc:
                 print(f"[chat cleanup] erro: {exc}")
+            try:
+                if SUPABASE_ENABLED:
+                    await _file_metadata_purge_expired()
+            except Exception as exc:
+                print(f"[file cleanup] erro: {exc}")
 
     asyncio.create_task(loop())
 
@@ -526,50 +647,54 @@ def health():
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_file(file: UploadFile = File(...)):
-    with _lock:
-        metadata = _load_metadata()
-        code = _generate_code(metadata)
+    if not SUPABASE_ENABLED:
+        raise HTTPException(status_code=500, detail="Supabase não configurado no servidor")
 
-    folder = STORAGE_DIR / code
-    folder.mkdir(parents=True, exist_ok=True)
-    dest_path = folder / file.filename
+    contents = await file.read()
+    size = len(contents)
+    if size > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Arquivo excede o limite de {MAX_FILE_SIZE_MB}MB",
+        )
 
-    size = 0
+    # Gera um código de 6 caracteres verificando colisão contra a tabela file_metadata
+    code = None
+    for _ in range(10):
+        candidate = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+        if not await _file_metadata_code_exists(candidate):
+            code = candidate
+            break
+    if code is None:
+        raise HTTPException(status_code=500, detail="Falha ao gerar código único, tente novamente")
+
+    storage_path = f"{code}/{file.filename}"
+
     try:
-        with open(dest_path, "wb") as out_file:
-            while True:
-                chunk = await file.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_FILE_SIZE_BYTES:
-                    out_file.close()
-                    shutil.rmtree(folder, ignore_errors=True)
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Arquivo excede o limite de {MAX_FILE_SIZE_MB}MB",
-                    )
-                out_file.write(chunk)
-    except HTTPException:
-        raise
+        await _supabase_storage_upload(storage_path, contents)
     except Exception as exc:
-        shutil.rmtree(folder, ignore_errors=True)
-        print(f"[upload] falha ao salvar arquivo (code={code}): {exc}")
+        print(f"[upload] falha ao enviar para Supabase Storage (code={code}): {exc}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Falha no upload: {exc}")
 
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(hours=EXPIRATION_HOURS)
 
-    with _lock:
-        metadata = _load_metadata()
-        metadata[code] = {
+    try:
+        await _file_metadata_insert({
+            "code": code,
             "filename": file.filename,
             "size": size,
+            "storage_path": storage_path,
             "uploaded_at": now.isoformat(),
             "expires_at": expires_at.isoformat(),
-        }
-        _save_metadata(metadata)
+        })
+    except Exception as exc:
+        print(f"[upload] falha ao gravar file_metadata (code={code}): {exc}")
+        traceback.print_exc()
+        # Reverte o upload no Storage já que o registro não foi criado
+        await _supabase_storage_delete(storage_path)
+        raise HTTPException(status_code=500, detail=f"Falha ao registrar upload: {exc}")
 
     return UploadResponse(
         code=code, filename=file.filename, size=size, expires_at=expires_at.isoformat()
@@ -577,51 +702,55 @@ async def upload_file(file: UploadFile = File(...)):
 
 
 @app.get("/files/{code}", response_model=FileInfoResponse)
-def file_info(code: str):
+async def file_info(code: str):
     code = code.upper().strip()
-    metadata = _load_metadata()
-    info = metadata.get(code)
+    info = await _file_metadata_get(code)
     if not info:
         raise HTTPException(status_code=404, detail="Código não encontrado ou expirado")
-    return FileInfoResponse(**info)
+    return FileInfoResponse(
+        filename=info["filename"],
+        size=info["size"],
+        uploaded_at=info["uploaded_at"],
+        expires_at=info["expires_at"],
+    )
 
 
 @app.get("/download/{code}")
-def download_file(code: str):
+async def download_file(code: str):
     code = code.upper().strip()
-    metadata = _load_metadata()
-    info = metadata.get(code)
+    info = await _file_metadata_get(code)
     if not info:
         raise HTTPException(status_code=404, detail="Código não encontrado ou expirado")
 
-    file_path = STORAGE_DIR / code / info["filename"]
-    if not file_path.exists():
+    try:
+        data = await _supabase_storage_download(info["storage_path"])
+    except Exception as exc:
+        print(f"[download] erro ao buscar arquivo do Storage (code={code}): {exc}")
         raise HTTPException(status_code=404, detail="Arquivo não encontrado no servidor")
 
-    def cleanup_after_download():
-        with _lock:
-            current_metadata = _load_metadata()
-            if code in current_metadata:
-                _delete_file(code, current_metadata)
+    async def cleanup_after_download():
+        if DELETE_AFTER_DOWNLOAD:
+            await _supabase_storage_delete(info["storage_path"])
+            await _file_metadata_delete(code)
 
     background = BackgroundTask(cleanup_after_download) if DELETE_AFTER_DOWNLOAD else None
 
-    return FileResponse(
-        path=file_path,
-        filename=info["filename"],
+    return Response(
+        content=data,
         media_type="application/octet-stream",
-        background=background
+        headers={"Content-Disposition": f'attachment; filename="{info["filename"]}"'},
+        background=background,
     )
 
 
 @app.delete("/files/{code}")
-def delete_file(code: str):
+async def delete_file(code: str):
     code = code.upper().strip()
-    with _lock:
-        metadata = _load_metadata()
-        if code not in metadata:
-            raise HTTPException(status_code=404, detail="Código não encontrado")
-        _delete_file(code, metadata)
+    info = await _file_metadata_get(code)
+    if not info:
+        raise HTTPException(status_code=404, detail="Código não encontrado")
+    await _supabase_storage_delete(info["storage_path"])
+    await _file_metadata_delete(code)
     return {"status": "deleted", "code": code}
 
 
