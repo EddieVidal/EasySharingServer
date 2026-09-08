@@ -34,7 +34,7 @@ STORAGE_DIR = Path(os.environ.get("STORAGE_DIR", "./storage"))
 METADATA_FILE = STORAGE_DIR / "_metadata.json"
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "200"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-EXPIRATION_HOURS = float(os.environ.get("EXPIRATION_HOURS", "6"))
+EXPIRATION_HOURS = float(os.environ.get("EXPIRATION_HOURS", "168"))
 DELETE_AFTER_DOWNLOAD = os.environ.get("DELETE_AFTER_DOWNLOAD", "true").lower() == "true"
 CHUNK_SIZE = 1024 * 1024
 CODE_LENGTH = 6
