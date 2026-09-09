@@ -1,14 +1,18 @@
 """
-FileSend Relay Server v2.4
+FileSend Relay Server v2.5
 --------------------------
 Servidor relay otimizado para plataformas de nuvem com suspensão automática (Render, Koyeb).
 Utiliza FileResponse para entregas HTTP com Content-Length garantido, suporte a CORS,
 e limpeza automática de arquivos de uso único.
 
-A fila de mensagens de chat pendentes (destinatário offline no envio) e os arquivos
-enviados são persistidos no Supabase (Postgres + Storage), porque o disco local desses
-provedores é efêmero — some a cada redeploy, reinício ou "spin down" por inatividade
-do plano free.
+A fila de mensagens de chat pendentes e os metadados dos arquivos (código, nome,
+tamanho, expiração) são persistidos no Supabase (Postgres), porque o disco local
+desses provedores é efêmero — some a cada redeploy, reinício ou "spin down" por
+inatividade do plano free.
+
+Os bytes dos arquivos em si ficam no Backblaze B2 (compatível com S3), em vez do
+Supabase Storage, porque o plano free do Supabase Storage trava em 50MB por arquivo
+e o B2 não tem esse teto (10GB grátis, sem exigir cartão de crédito).
 """
 
 import os
@@ -25,6 +29,8 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import boto3
+from botocore.config import Config
 from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,7 +48,8 @@ CODE_LENGTH = 6
 CODE_ALPHABET = "".join(c for c in (string.ascii_uppercase + string.digits) if c not in "0O1IL")
 
 # ------------------------------------------------------------------
-# Fila de mensagens de chat pendentes — persistida no Supabase
+# Fila de mensagens de chat pendentes + metadados de arquivos —
+# persistidos no Supabase (Postgres)
 # ------------------------------------------------------------------
 MESSAGE_QUEUE_HOURS = float(os.environ.get("MESSAGE_QUEUE_HOURS", "48"))
 MESSAGE_QUEUE_MAX_PER_CHANNEL = int(os.environ.get("MESSAGE_QUEUE_MAX_PER_CHANNEL", "50"))
@@ -51,22 +58,13 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_TABLE = "pending_messages"
 SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
-
-# ------------------------------------------------------------------
-# Arquivos enviados — persistidos no Supabase Storage (bucket "files")
-# + tabela file_metadata (Postgres), pelo mesmo motivo da fila de chat:
-# o disco local (STORAGE_DIR / _metadata.json) some a cada spin down
-# ou redeploy do Render, o que causava 404 em downloads de arquivos
-# enviados antes do último restart do servidor.
-# ------------------------------------------------------------------
-SUPABASE_STORAGE_BUCKET = "files"
 FILE_METADATA_TABLE = "file_metadata"
 
 if not SUPABASE_ENABLED:
     print(
         "[AVISO] SUPABASE_URL / SUPABASE_SERVICE_KEY não configurados: a fila de mensagens "
         "pendentes vai funcionar só em memória e será perdida a cada reinício/sono do servidor, "
-        "e o upload/download de arquivos não vai funcionar."
+        "e o upload/download de arquivos não vai funcionar (metadados ficam no Supabase)."
     )
 
 _http_client: httpx.AsyncClient | None = None
@@ -91,41 +89,79 @@ def _supabase_headers(extra: dict | None = None) -> dict:
 
 
 # ------------------------------------------------------------------
-# Helpers: Supabase Storage + tabela file_metadata
+# Backblaze B2 (compatível com S3) — armazenamento dos bytes dos arquivos
 # ------------------------------------------------------------------
-async def _supabase_storage_upload(path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
-    client = await _get_http_client()
-    resp = await client.post(
-        f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{path}",
-        headers=_supabase_headers({"Content-Type": content_type}),
-        content=data,
+B2_KEY_ID = os.environ.get("B2_KEY_ID", "")
+B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "")
+B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "")
+B2_ENDPOINT = os.environ.get("B2_ENDPOINT", "").rstrip("/")  # ex: https://s3.us-west-004.backblazeb2.com
+B2_ENABLED = bool(B2_KEY_ID and B2_APPLICATION_KEY and B2_BUCKET_NAME and B2_ENDPOINT)
+
+if not B2_ENABLED:
+    print(
+        "[AVISO] Variáveis do Backblaze B2 (B2_KEY_ID / B2_APPLICATION_KEY / B2_BUCKET_NAME / "
+        "B2_ENDPOINT) não configuradas: upload e download de arquivos não vão funcionar."
     )
-    resp.raise_for_status()
 
 
-async def _supabase_storage_download(path: str) -> bytes:
-    client = await _get_http_client()
-    resp = await client.get(
-        f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{path}",
-        headers=_supabase_headers(),
-    )
-    resp.raise_for_status()
-    return resp.content
+def _b2_region_from_endpoint(endpoint: str) -> str:
+    """Extrai a região do endpoint do B2, ex: 'https://s3.us-west-004.backblazeb2.com' -> 'us-west-004'."""
+    host = endpoint.split("://", 1)[-1]
+    parts = host.split(".")
+    return parts[1] if len(parts) > 1 else "us-west-004"
 
 
-async def _supabase_storage_delete(path: str) -> None:
-    client = await _get_http_client()
-    try:
-        resp = await client.delete(
-            f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{path}",
-            headers=_supabase_headers(),
+_r2_client = None
+
+
+def _get_r2_client():
+    global _r2_client
+    if _r2_client is None:
+        _r2_client = boto3.client(
+            "s3",
+            endpoint_url=B2_ENDPOINT,
+            aws_access_key_id=B2_KEY_ID,
+            aws_secret_access_key=B2_APPLICATION_KEY,
+            config=Config(signature_version="s3v4"),
+            region_name=_b2_region_from_endpoint(B2_ENDPOINT) if B2_ENDPOINT else "us-west-004",
         )
-        if resp.status_code >= 400:
-            print(f"[storage] erro ao apagar {path}: {resp.status_code} {resp.text}")
+    return _r2_client
+
+
+async def _r2_upload(path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+    client = _get_r2_client()
+
+    def _put():
+        client.put_object(Bucket=B2_BUCKET_NAME, Key=path, Body=data, ContentType=content_type)
+
+    await asyncio.to_thread(_put)
+
+
+async def _r2_download(path: str) -> bytes:
+    client = _get_r2_client()
+
+    def _get() -> bytes:
+        resp = client.get_object(Bucket=B2_BUCKET_NAME, Key=path)
+        return resp["Body"].read()
+
+    return await asyncio.to_thread(_get)
+
+
+async def _r2_delete(path: str) -> None:
+    client = _get_r2_client()
+
+    def _delete():
+        client.delete_object(Bucket=B2_BUCKET_NAME, Key=path)
+
+    try:
+        await asyncio.to_thread(_delete)
     except Exception as exc:
-        print(f"[storage] erro ao apagar {path}: {exc}")
+        print(f"[b2] erro ao apagar {path}: {exc}")
 
 
+# ------------------------------------------------------------------
+# Helpers: tabela file_metadata no Supabase (Postgres)
+# ------------------------------------------------------------------
 async def _file_metadata_get(code: str) -> dict | None:
     client = await _get_http_client()
     resp = await client.get(
@@ -167,7 +203,7 @@ async def _file_metadata_delete(code: str) -> None:
 
 
 async def _file_metadata_purge_expired() -> None:
-    """Remove do bucket e da tabela os arquivos cujo expires_at já passou."""
+    """Remove do B2 e da tabela os arquivos cujo expires_at já passou."""
     client = await _get_http_client()
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -183,7 +219,7 @@ async def _file_metadata_purge_expired() -> None:
         return
 
     for row in rows:
-        await _supabase_storage_delete(row["storage_path"])
+        await _r2_delete(row["storage_path"])
         await _file_metadata_delete(row["code"])
 
 
@@ -281,9 +317,6 @@ def _generate_code(existing: dict) -> str:
             return code
 
 
-# ------------------------------------------------------------------
-# Backend: Supabase (persistente)
-# ----------------------------------------------------------------
 def _cleanup_loop():
     while True:
         try:
@@ -317,8 +350,8 @@ def _delete_file(code: str, metadata: dict, save: bool = True) -> None:
 
 # NOTA: _cleanup_loop/_load_metadata/_save_metadata/_generate_code/_delete_file acima
 # operavam sobre o disco local (STORAGE_DIR/_metadata.json) e não são mais usados pelos
-# endpoints de arquivo (migrados para Supabase Storage + file_metadata). Ficaram aqui
-# sem uso ativo; podem ser removidos com calma no futuro.
+# endpoints de arquivo (migrados para B2 + file_metadata no Supabase). Ficaram aqui sem
+# uso ativo; podem ser removidos com calma no futuro.
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
@@ -583,7 +616,7 @@ async def _start_chat_queue_cleanup():
             except Exception as exc:
                 print(f"[chat cleanup] erro: {exc}")
             try:
-                if SUPABASE_ENABLED:
+                if SUPABASE_ENABLED and B2_ENABLED:
                     await _file_metadata_purge_expired()
             except Exception as exc:
                 print(f"[file cleanup] erro: {exc}")
@@ -649,6 +682,8 @@ def health():
 async def upload_file(file: UploadFile = File(...)):
     if not SUPABASE_ENABLED:
         raise HTTPException(status_code=500, detail="Supabase não configurado no servidor")
+    if not B2_ENABLED:
+        raise HTTPException(status_code=500, detail="Backblaze B2 não configurado no servidor")
 
     contents = await file.read()
     size = len(contents)
@@ -671,9 +706,9 @@ async def upload_file(file: UploadFile = File(...)):
     storage_path = f"{code}/{file.filename}"
 
     try:
-        await _supabase_storage_upload(storage_path, contents)
+        await _r2_upload(storage_path, contents)
     except Exception as exc:
-        print(f"[upload] falha ao enviar para Supabase Storage (code={code}): {exc}")
+        print(f"[upload] falha ao enviar para o B2 (code={code}): {exc}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Falha no upload: {exc}")
 
@@ -692,8 +727,8 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as exc:
         print(f"[upload] falha ao gravar file_metadata (code={code}): {exc}")
         traceback.print_exc()
-        # Reverte o upload no Storage já que o registro não foi criado
-        await _supabase_storage_delete(storage_path)
+        # Reverte o upload no B2 já que o registro não foi criado
+        await _r2_delete(storage_path)
         raise HTTPException(status_code=500, detail=f"Falha ao registrar upload: {exc}")
 
     return UploadResponse(
@@ -723,14 +758,14 @@ async def download_file(code: str):
         raise HTTPException(status_code=404, detail="Código não encontrado ou expirado")
 
     try:
-        data = await _supabase_storage_download(info["storage_path"])
+        data = await _r2_download(info["storage_path"])
     except Exception as exc:
-        print(f"[download] erro ao buscar arquivo do Storage (code={code}): {exc}")
+        print(f"[download] erro ao buscar arquivo no B2 (code={code}): {exc}")
         raise HTTPException(status_code=404, detail="Arquivo não encontrado no servidor")
 
     async def cleanup_after_download():
         if DELETE_AFTER_DOWNLOAD:
-            await _supabase_storage_delete(info["storage_path"])
+            await _r2_delete(info["storage_path"])
             await _file_metadata_delete(code)
 
     background = BackgroundTask(cleanup_after_download) if DELETE_AFTER_DOWNLOAD else None
@@ -749,7 +784,7 @@ async def delete_file(code: str):
     info = await _file_metadata_get(code)
     if not info:
         raise HTTPException(status_code=404, detail="Código não encontrado")
-    await _supabase_storage_delete(info["storage_path"])
+    await _r2_delete(info["storage_path"])
     await _file_metadata_delete(code)
     return {"status": "deleted", "code": code}
 
