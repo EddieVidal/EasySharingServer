@@ -1,6 +1,6 @@
 {
   "version": "2.5",
   "download_url": "https://github.com/EddieVidal/EasySharingServer/releases/download/v2.5/EasySharing.exe",
-  "sha256": "256:24cfae0e79e1204da4387ce47538ab101b2182610a21763b8eb7c7feb87e8f57",
+  "sha256": "24cfae0e79e1204da4387ce47538ab101b2182610a21763b8eb7c7feb87e8f57",
   "changelog": "Correção de Bug de compartilhamento de arquivo."
 }
